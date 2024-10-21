@@ -71,6 +71,7 @@ def ring_flash_attn_backward(
     dropout_p=0,
     causal=True,
     window_size=(-1, -1),
+    softcap=0.0,
     alibi_slopes=None,
     deterministic=False,
 ):
@@ -93,26 +94,26 @@ def ring_flash_attn_backward(
             kv_comm.commit()
         if step <= kv_comm.rank or not causal:
             bwd_causal = causal and step == 0
-            params = get_default_args(_flash_attn_backward).copy()
-            params.update(
-                {
-                    "dout": dout,
-                    "q": q,
-                    "k": k,
-                    "v": v,
-                    "out": out,
-                    "softmax_lse": softmax_lse,
-                    "dq": block_dq_buffer,
-                    "dk": block_dk_buffer,
-                    "dv": block_dv_buffer,
-                    "dropout_p": dropout_p,
-                    "softmax_scale": softmax_scale,
-                    "causal": bwd_causal,
-                    "window_size": window_size,
-                    "alibi_slopes": alibi_slopes,
-                    "deterministic": deterministic,
-                }
-            )
+            # params = get_default_args(_flash_attn_backward).copy()
+            params = {
+                "dout": dout,
+                "q": q,
+                "k": k,
+                "v": v,
+                "out": out,
+                "softmax_lse": softmax_lse,
+                "dq": block_dq_buffer,
+                "dk": block_dk_buffer,
+                "dv": block_dv_buffer,
+                "dropout_p": dropout_p,
+                "softmax_scale": softmax_scale,
+                "causal": bwd_causal,
+                "window_size_left": window_size[0],
+                "window_size_right": window_size[1],
+                "softcap": softcap
+                "alibi_slopes": alibi_slopes,
+                "deterministic": deterministic,
+            }
             _flash_attn_backward(**params)
 
             if dq is None:
