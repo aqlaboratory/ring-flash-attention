@@ -45,7 +45,8 @@ def ring_flash_attn_forward(
                     "alibi_slopes": alibi_slopes,
                     "return_softmax": True and dropout_p > 0,
             }
-            block_out, _, _, _, _, block_lse, _, _ = _flash_attn_forward(**params)
+            # block_out, _, _, _, _, block_lse, _, _ = _flash_attn_forward(**params)
+            block_out, block_lse, _, _ = _flash_attn_forward(**params)
             out, lse = update_out_and_lse(out, lse, block_out, block_lse)
 
         if step + 1 != comm.world_size:
