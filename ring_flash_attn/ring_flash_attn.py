@@ -33,17 +33,17 @@ def ring_flash_attn_forward(
         if not causal or step <= comm.rank:
             # params = get_default_args(_flash_attn_forward).copy()
             params = {
-                    "q": q,
-                    "k": k,
-                    "v": v,
-                    "dropout_p": dropout_p,
-                    "softmax_scale": softmax_scale,
-                    "causal": causal and step == 0,
-                    "window_size_left": window_size[0],
-                    "window_size_right": window_size[1],
-                    "softcap": softcap,
-                    "alibi_slopes": alibi_slopes,
-                    "return_softmax": True and dropout_p > 0,
+                "q": q,
+                "k": k,
+                "v": v,
+                "dropout_p": dropout_p,
+                "softmax_scale": softmax_scale,
+                "causal": causal and step == 0,
+                "window_size_left": window_size[0],
+                "window_size_right": window_size[1],
+                "softcap": softcap,
+                "alibi_slopes": alibi_slopes,
+                "return_softmax": True and dropout_p > 0,
             }
             # block_out, _, _, _, _, block_lse, _, _ = _flash_attn_forward(**params)
             block_out, block_lse, _, _ = _flash_attn_forward(**params)
@@ -110,7 +110,7 @@ def ring_flash_attn_backward(
                 "causal": bwd_causal,
                 "window_size_left": window_size[0],
                 "window_size_right": window_size[1],
-                "softcap": softcap
+                "softcap": softcap,
                 "alibi_slopes": alibi_slopes,
                 "deterministic": deterministic,
             }
