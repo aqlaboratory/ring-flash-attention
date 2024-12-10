@@ -116,6 +116,7 @@ def llama_flash_attn_forward(
     out = torch.cat(out_list, dim=2)
     '''Check lse dimensions
     '''
+    print(out.shape)
     lse = torch.cat(lse_list, dim=-2)
     return out, lse
 
