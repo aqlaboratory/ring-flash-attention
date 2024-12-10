@@ -67,6 +67,7 @@ def llama_flash_attn_forward(
             kv_buffer_copy[1], v_0, group=process_group, async_op=True
         )
     )
+    print(k.shape)
 
     for i in range(0, nheads_k, heads_k_stride):
         async_handles.wait()
@@ -116,7 +117,6 @@ def llama_flash_attn_forward(
     out = torch.cat(out_list, dim=2)
     '''Check lse dimensions
     '''
-    print(out.shape)
     lse = torch.cat(lse_list, dim=-2)
     return out, lse
 
