@@ -24,7 +24,7 @@ def llama_flash_attn_forward(
     k: torch.Tensor,
     v: torch.Tensor,
     heads_k_stride,
-    local_k_slice,
+    # local_k_slice,  # k slice is only meant for var_len (q_local only attend to k_slice)
     softmax_scale,
     dropout_p=0,
     causal=True,
@@ -85,8 +85,8 @@ def llama_flash_attn_forward(
             )
 
         q_i = q[:, i * nheads // nheads_k : (i + heads_k_stride) * nheads // nheads_k]
-        k_i = kv_buffer[0][local_k_slice]
-        v_i = kv_buffer[1][local_k_slice]
+        k_i = kv_buffer[0]#[local_k_slice]
+        v_i = kv_buffer[1]#[local_k_slice]
 
         # params = get_default_args(_flash_attn_varlen_forward).copy()
         params = {
@@ -119,6 +119,8 @@ class LlamaRingFlashAttnFunc(torch.autograd.Function):
         q,
         k,
         v,
+        heads_k_stride,
+        local_k_slice,
         dropout_p,
         softmax_scale,
         causal,
@@ -182,6 +184,7 @@ def llama_fwd_ring_bwd_flash_attn_func(
     q,
     k,
     v,
+    heads_k_stride=1,  # default 1 always works, but need optimize
     dropout_p=0.0,
     softmax_scale=None,
     causal=False,
@@ -195,6 +198,7 @@ def llama_fwd_ring_bwd_flash_attn_func(
         q,
         k,
         v,
+        heads_k_stride,
         dropout_p,
         softmax_scale,
         causal,
