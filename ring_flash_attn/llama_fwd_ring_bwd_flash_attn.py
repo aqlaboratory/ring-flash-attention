@@ -120,7 +120,7 @@ class LlamaRingFlashAttnFunc(torch.autograd.Function):
         k,
         v,
         heads_k_stride,
-        local_k_slice,
+        # local_k_slice,
         dropout_p,
         softmax_scale,
         causal,
