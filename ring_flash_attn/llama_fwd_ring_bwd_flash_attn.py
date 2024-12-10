@@ -67,7 +67,6 @@ def llama_flash_attn_forward(
             kv_buffer_copy[1], v_0, group=process_group, async_op=True
         )
     )
-    print(k.shape)
 
     for i in range(0, nheads_k, heads_k_stride):
         async_handles.wait()
@@ -93,6 +92,8 @@ def llama_flash_attn_forward(
         q_i = q[:, :, i * nheads // nheads_k : (i + heads_k_stride) * nheads // nheads_k]
         k_i = kv_buffer[0]#[local_k_slice]
         v_i = kv_buffer[1]#[local_k_slice]
+        print(q_i.shape)
+        print(k_i.shape)
 
         # params = get_default_args(_flash_attn_varlen_forward).copy()
         params = {
