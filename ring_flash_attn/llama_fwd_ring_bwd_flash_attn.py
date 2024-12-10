@@ -36,20 +36,24 @@ def llama_flash_attn_forward(
     lse_list = []
 
     nheads = q.shape[1]
-    total_k, nheads_k, head_dim = k.shape
+    # total_k, nheads_k, head_dim = k.shape
+    batch_k, seq_k, nheads_k, head_dim = k.shape
     assert nheads_k % heads_k_stride == 0
 
     world_size = dist.get_world_size(process_group)
     kv_buffer = torch.empty(
-        (2, total_k * world_size, heads_k_stride, head_dim),
+        # (2, total_k * world_size, heads_k_stride, head_dim),
+        (2, batch_k, seq_k * world_size, heads_k_stride, head_dim),
         dtype=k.dtype,
         device=k.device,
     )
 
     kv_buffer_copy = torch.empty_like(kv_buffer)
 
-    k_0 = k[:, :heads_k_stride].contiguous()
-    v_0 = v[:, :heads_k_stride].contiguous()
+    # k_0 = k[:, :heads_k_stride].contiguous()
+    # v_0 = v[:, :heads_k_stride].contiguous()
+    k_0 = k[:, :, :heads_k_stride].contiguous()
+    v_0 = v[:, :, :heads_k_stride].contiguous()
     async_handles = AsyncHandles()
 
     async_handles.register(
@@ -71,8 +75,8 @@ def llama_flash_attn_forward(
             # all_gather the next kv slice
             kv_slice_left = i + heads_k_stride
             kv_slice_right = kv_slice_left + heads_k_stride
-            send_k = k[:, kv_slice_left:kv_slice_right].contiguous()
-            send_v = v[:, kv_slice_left:kv_slice_right].contiguous()
+            send_k = k[:,:,  kv_slice_left:kv_slice_right].contiguous()
+            send_v = v[:,:,  kv_slice_left:kv_slice_right].contiguous()
             async_handles.register(
                 dist.all_gather_into_tensor(
                     kv_buffer_copy[0], send_k, group=process_group, async_op=True
@@ -84,7 +88,7 @@ def llama_flash_attn_forward(
                 )
             )
 
-        q_i = q[:, i * nheads // nheads_k : (i + heads_k_stride) * nheads // nheads_k]
+        q_i = q[:, :, i * nheads // nheads_k : (i + heads_k_stride) * nheads // nheads_k]
         k_i = kv_buffer[0]#[local_k_slice]
         v_i = kv_buffer[1]#[local_k_slice]
 
@@ -107,7 +111,10 @@ def llama_flash_attn_forward(
         out_list.append(out)
         lse_list.append(lse)
 
-    out = torch.cat(out_list, dim=1)
+    # out = torch.cat(out_list, dim=1)
+    out = torch.cat(out_list, dim=2)
+    '''Check lse dimensions
+    '''
     lse = torch.cat(lse_list, dim=-2)
     return out, lse
 
