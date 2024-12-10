@@ -92,6 +92,7 @@ def llama_flash_attn_forward(
         q_i = q[:, :, i * nheads // nheads_k : (i + heads_k_stride) * nheads // nheads_k]
         k_i = kv_buffer[0]#[local_k_slice]
         v_i = kv_buffer[1]#[local_k_slice]
+        print(k_i.shape)
 
         # params = get_default_args(_flash_attn_varlen_forward).copy()
         params = {
