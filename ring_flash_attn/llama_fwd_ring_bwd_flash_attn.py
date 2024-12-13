@@ -36,7 +36,7 @@ def llama_flash_attn_forward(
     out_list = []
     lse_list = []
 
-    nheads = q.shape[1]
+    nheads = q.shape[2]
     # total_k, nheads_k, head_dim = k.shape
     batch_k, seq_k, nheads_k, head_dim = k.shape
     assert nheads_k % heads_k_stride == 0
