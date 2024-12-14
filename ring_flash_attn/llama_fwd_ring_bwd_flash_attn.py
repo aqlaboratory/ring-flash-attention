@@ -309,3 +309,33 @@ class Llama3FlashAttnFunc(torch.autograd.Function):
             deterministic=ctx.deterministic,
         )
         return (dq, dk, dv) + (None,) * 15
+
+
+def llama3_flash_attn_func(
+    q,
+    k,
+    v,
+    heads_k_stride,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),  # -1 means infinite context window
+    alibi_slopes=None,
+    deterministic=False,
+    return_attn_probs=False,
+    group=None,
+):
+    return Llama3FlashAttnFunc.apply(
+        q,
+        k,
+        v,
+        heads_k_stride,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size,
+        alibi_slopes,
+        deterministic,
+        return_attn_probs,
+        group,
+    )
