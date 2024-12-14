@@ -218,3 +218,94 @@ def llama_fwd_ring_bwd_flash_attn_func(
         return_attn_probs,
         group,
     )
+
+from .llama3_flash_attn_varlen import llama3_flash_attn_varlen_backward, llama3_flash_attn_varlen_forward
+
+class Llama3FlashAttnFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        q,
+        k,
+        v,
+        heads_k_stride,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size,
+        alibi_slopes,
+        deterministic,
+        return_softmax,
+        group,
+    ):
+        batch_k, seq_k, nheads_k, head_dim = k.shape
+        cu_seqlens = torch.arange(0, (batch_k + 1) * seq_k, step=seq_k,
+                                  dtype=torch.int32, device=k.device)
+        world_size = dist.get_world_size(group=group)
+        rank = dist.get_rank(group=group)
+        (cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, local_k_slice
+        ) = llama3_flash_attn_prepare_cu_seqlens(cu_seqlens, causal, rank, world_size)
+        if softmax_scale is None:
+            softmax_scale = q.shape[-1] ** (-0.5)
+
+        assert alibi_slopes is None
+        k = k.contiguous().view(-1,  nheads_k, head_dim)
+        v = v.contiguous().view(-1,  nheads_k, head_dim)
+        out, softmax_lse = llama3_flash_attn_varlen_forward(
+            group,
+            q.view(-1,  nheads_k, head_dim),
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            heads_k_stride,
+            local_k_slice,
+            softmax_scale=softmax_scale,
+            dropout_p=dropout_p,
+            causal=causal,
+            window_size=window_size,
+            alibi_slopes=alibi_slopes,
+            deterministic=False,
+        )
+        # this should be out_padded
+        ctx.save_for_backward(q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k)
+        ctx.max_seqlen_q = max_seqlen_q
+        ctx.max_seqlen_k = max_seqlen_k
+        ctx.heads_k_stride = heads_k_stride
+        ctx.local_k_slice = local_k_slice
+        ctx.dropout_p = dropout_p
+        ctx.softmax_scale = softmax_scale
+        ctx.causal = causal
+        ctx.window_size = window_size
+        ctx.alibi_slopes = alibi_slopes
+        ctx.deterministic = deterministic
+        ctx.group = group
+        return out.view(batch_k, seq_k, nheads_k, head_dim) if not return_softmax else (out, softmax_lse, None)
+
+    @staticmethod
+    def backward(ctx, dout, *args):
+        q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k = ctx.saved_tensors
+        dq, dk, dv = llama3_flash_attn_varlen_backward(
+            ctx.group,
+            dout,
+            q,
+            k,
+            v,
+            out,
+            softmax_lse,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            ctx.max_seqlen_q,
+            ctx.max_seqlen_k,
+            ctx.heads_k_stride,
+            ctx.local_k_slice,
+            softmax_scale=ctx.softmax_scale,
+            dropout_p=ctx.dropout_p,
+            causal=ctx.causal,
+            window_size=ctx.window_size,
+            alibi_slopes=ctx.alibi_slopes,
+            deterministic=ctx.deterministic,
+        )
+        return (dq, dk, dv) + (None,) * 15
