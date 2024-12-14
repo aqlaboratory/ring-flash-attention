@@ -75,6 +75,7 @@ def llama3_flash_attn_varlen_forward(
     dropout_p=0,
     causal=True,
     window_size=(-1, -1),
+    softcap=0.0,
     alibi_slopes=None,
     deterministic=False,
 ):
@@ -135,8 +136,7 @@ def llama3_flash_attn_varlen_forward(
         v_i = kv_buffer[1][local_k_slice]
 
         params = get_default_args(_flash_attn_varlen_forward).copy()
-        params.update(
-            {
+        params = {
                 "q": q_i,
                 "k": k_i,
                 "v": v_i,
@@ -147,12 +147,16 @@ def llama3_flash_attn_varlen_forward(
                 "dropout_p": dropout_p,
                 "softmax_scale": softmax_scale,
                 "causal": causal,
-                "window_size": window_size,
+                "window_size_left": window_size[0],
+                "window_size_right": window_size[1],
+                "softcap": softcap,
                 "alibi_slopes": alibi_slopes,
                 "return_softmax": True and dropout_p > 0,
-            }
+        }
+        # out, _, _, _, _, lse, _, _ = _flash_attn_varlen_forward(**params)
+        out, lse, _, _ = _flash_attn_varlen_forward(
+            **params
         )
-        out, _, _, _, _, lse, _, _ = _flash_attn_varlen_forward(**params)
         out_list.append(out)
         lse_list.append(lse)
 
@@ -179,6 +183,7 @@ def llama3_flash_attn_varlen_backward(
     dropout_p=0,
     causal=True,
     window_size=(-1, -1),
+    softcap=0.0,
     alibi_slopes=None,
     deterministic=False,
 ):
@@ -266,9 +271,8 @@ def llama3_flash_attn_varlen_backward(
         dk_i = dkv_buffer[0][local_k_slice]
         dv_i = dkv_buffer[1][local_k_slice]
 
-        params = get_default_args(_flash_attn_varlen_backward).copy()
-        params.update(
-            {
+        # params = get_default_args(_flash_attn_varlen_backward).copy()
+        params = {
                 "dout": dout_i,
                 "q": q_i,
                 "k": k_i,
@@ -285,11 +289,12 @@ def llama3_flash_attn_varlen_backward(
                 "dropout_p": dropout_p,
                 "softmax_scale": softmax_scale,
                 "causal": causal,
-                "window_size": window_size,
+                "window_size_left": window_size[0],
+                "window_size_right": window_size[1],
+                "softcap": softcap,
                 "alibi_slopes": alibi_slopes,
                 "deterministic": deterministic,
-            }
-        )
+        }
         _flash_attn_varlen_backward(**params)
 
         if heads_k_stride != nheads_k:
