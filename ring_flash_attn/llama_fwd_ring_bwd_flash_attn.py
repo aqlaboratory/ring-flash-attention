@@ -219,7 +219,7 @@ def llama_fwd_ring_bwd_flash_attn_func(
         group,
     )
 
-from .llama3_flash_attn_varlen import llama3_flash_attn_varlen_backward, llama3_flash_attn_varlen_forward
+from .llama3_flash_attn_varlen import llama3_flash_attn_varlen_backward, llama3_flash_attn_varlen_forward, llama3_flash_attn_prepare_cu_seqlens
 
 class Llama3FlashAttnFunc(torch.autograd.Function):
     @staticmethod
