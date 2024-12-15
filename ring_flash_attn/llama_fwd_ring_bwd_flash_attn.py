@@ -249,9 +249,6 @@ class Llama3FlashAttnFunc(torch.autograd.Function):
             softmax_scale = q.shape[-1] ** (-0.5)
 
         assert alibi_slopes is None
-        k = k.contiguous().view(-1,  nheads_k, head_dim)
-        v = v.contiguous().view(-1,  nheads_k, head_dim)
-        q = q.contiguous().view(-1,  nheads_k, head_dim)
         out, softmax_lse = llama3_flash_attn_varlen_forward(
             group,
             q,
@@ -327,6 +324,9 @@ def llama3_flash_attn_func(
     group=None,
 ):
     batch_k, seq_k, nheads_k, head_dim = k.shape
+    k = k.contiguous().view(-1,  nheads_k, head_dim)
+    v = v.contiguous().view(-1,  nheads_k, head_dim)
+    q = q.contiguous().view(-1,  nheads_k, head_dim)
     output = Llama3FlashAttnFunc.apply(
         q,
         k,
