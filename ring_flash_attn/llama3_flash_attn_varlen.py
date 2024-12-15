@@ -5,7 +5,6 @@ from flash_attn.flash_attn_interface import (
     _flash_attn_varlen_backward,
 )
 from .utils import get_default_args
-import logging
 
 class AsyncHandles:
 
@@ -153,7 +152,6 @@ def llama3_flash_attn_varlen_forward(
                 "alibi_slopes": alibi_slopes,
                 "return_softmax": True and dropout_p > 0,
         }
-        logging.debug(params)
         # out, _, _, _, _, lse, _, _ = _flash_attn_varlen_forward(**params)
         out, lse, _, _ = _flash_attn_varlen_forward(
             **params
