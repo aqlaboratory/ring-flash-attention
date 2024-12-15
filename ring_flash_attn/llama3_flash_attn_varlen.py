@@ -5,7 +5,7 @@ from flash_attn.flash_attn_interface import (
     _flash_attn_varlen_backward,
 )
 from .utils import get_default_args
-
+import logging
 
 class AsyncHandles:
 
