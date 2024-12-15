@@ -219,7 +219,7 @@ def llama_fwd_ring_bwd_flash_attn_func(
         group,
     )
 
-from .llama3_flash_attn_varlen import llama3_flash_attn_varlen_backward, llama3_flash_attn_varlen_forward, llama3_flash_attn_prepare_cu_seqlens
+from .llama3_flash_attn_varlen import llama3_flash_attn_varlen_backward, llama3_flash_attn_varlen_forward, llama3_flash_attn_prepare_cu_seqlens, Llama3FlashAttnVarlenFunc
 
 class Llama3FlashAttnFunc(torch.autograd.Function):
     @staticmethod
@@ -228,7 +228,12 @@ class Llama3FlashAttnFunc(torch.autograd.Function):
         q,
         k,
         v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
         heads_k_stride,
+        local_k_slice,
         dropout_p,
         softmax_scale,
         causal,
@@ -238,13 +243,7 @@ class Llama3FlashAttnFunc(torch.autograd.Function):
         return_softmax,
         group,
     ):
-        batch_k, seq_k, nheads_k, head_dim = k.shape
-        cu_seqlens = torch.arange(0, (batch_k + 1) * seq_k, step=seq_k,
-                                  dtype=torch.int32, device=k.device)
-        world_size = dist.get_world_size(group=group)
-        rank = dist.get_rank(group=group)
-        (cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, local_k_slice
-        ) = llama3_flash_attn_prepare_cu_seqlens(cu_seqlens, causal, rank, world_size)
+
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
 
@@ -324,14 +323,25 @@ def llama3_flash_attn_func(
     group=None,
 ):
     batch_k, seq_k, nheads_k, head_dim = k.shape
+    cu_seqlens = torch.arange(0, (batch_k + 1) * seq_k, step=seq_k,
+                              dtype=torch.int32, device=k.device)
+    world_size = dist.get_world_size(group=group)
+    rank = dist.get_rank(group=group)
+    (cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, local_k_slice
+    ) = llama3_flash_attn_prepare_cu_seqlens(cu_seqlens, causal, rank, world_size)
     k = k.contiguous().view(-1,  nheads_k, head_dim)
     v = v.contiguous().view(-1,  nheads_k, head_dim)
     q = q.contiguous().view(-1,  nheads_k, head_dim)
-    output = Llama3FlashAttnFunc.apply(
+    output = Llama3FlashAttnVarlenFunc.apply(
         q,
         k,
         v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
         heads_k_stride,
+        local_k_slice,
         dropout_p,
         softmax_scale,
         causal,
