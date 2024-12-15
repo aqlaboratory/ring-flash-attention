@@ -324,10 +324,10 @@ def llama3_flash_attn_func(
     group=None,
 ):
     batch_k, seq_k, nheads_k, head_dim = k.shape
-    cu_seqlens = torch.arange(0, (batch_k + 1) * seq_k, step=seq_k,
-                              dtype=torch.int32, device=k.device)
     world_size = dist.get_world_size(group=group)
     rank = dist.get_rank(group=group)
+    cu_seqlens = torch.arange(0, (batch_k + 1) * seq_k*world_size, step=seq_k*world_size,
+                              dtype=torch.int32, device=k.device)
     (cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, local_k_slice
     ) = llama3_flash_attn_prepare_cu_seqlens(cu_seqlens, causal, rank, world_size)
     logging.debug(f"{cu_seqlens_q}, {cu_seqlens_k}, {max_seqlen_q}, {max_seqlen_k}, {local_k_slice}")
