@@ -135,7 +135,7 @@ def llama3_flash_attn_varlen_forward(
         k_i = kv_buffer[0][local_k_slice]
         v_i = kv_buffer[1][local_k_slice]
 
-        params = get_default_args(_flash_attn_varlen_forward).copy()
+        # params = get_default_args(_flash_attn_varlen_forward).copy()
         params = {
                 "q": q_i,
                 "k": k_i,
@@ -153,6 +153,7 @@ def llama3_flash_attn_varlen_forward(
                 "alibi_slopes": alibi_slopes,
                 "return_softmax": True and dropout_p > 0,
         }
+        logging.debug(params)
         # out, _, _, _, _, lse, _, _ = _flash_attn_varlen_forward(**params)
         out, lse, _, _ = _flash_attn_varlen_forward(
             **params
