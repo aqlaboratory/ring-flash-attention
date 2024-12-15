@@ -283,7 +283,7 @@ class Llama3FlashAttnFunc(torch.autograd.Function):
         ctx.alibi_slopes = alibi_slopes
         ctx.deterministic = deterministic
         ctx.group = group
-        return out.view(batch_k, seq_k, nheads_k, head_dim) if not return_softmax else (out, softmax_lse, None)
+        return out if not return_softmax else (out, softmax_lse, None)
 
     @staticmethod
     def backward(ctx, dout, *args):
@@ -326,7 +326,8 @@ def llama3_flash_attn_func(
     return_attn_probs=False,
     group=None,
 ):
-    return Llama3FlashAttnFunc.apply(
+    batch_k, seq_k, nheads_k, head_dim = k.shape
+    output = Llama3FlashAttnFunc.apply(
         q,
         k,
         v,
@@ -340,3 +341,8 @@ def llama3_flash_attn_func(
         return_attn_probs,
         group,
     )
+    if return_attn_probs:
+        (out, softmax_lse, none) = output
+        return out.view(batch_k, seq_k, nheads_k, head_dim), softmax_lse, none
+    else:
+        return output.view(batch_k, seq_k, nheads_k, head_dim)
