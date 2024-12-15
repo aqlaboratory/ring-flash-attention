@@ -355,6 +355,6 @@ def llama3_flash_attn_func(
     )
     if return_attn_probs:
         (out, softmax_lse, none) = output
-        return rearrange(out, '(b s) h d -> b s h d'), softmax_lse, none
+        return rearrange(out, '(b s) h d -> b s h d', b=batch_k), softmax_lse, none
     else:
-        return rearrange(output, '(b s) h d -> b s h d')
+        return rearrange(output, '(b s) h d -> b s h d', b=batch_k)
