@@ -251,9 +251,10 @@ class Llama3FlashAttnFunc(torch.autograd.Function):
         assert alibi_slopes is None
         k = k.contiguous().view(-1,  nheads_k, head_dim)
         v = v.contiguous().view(-1,  nheads_k, head_dim)
+        q = q.contiguous().view(-1,  nheads_k, head_dim)
         out, softmax_lse = llama3_flash_attn_varlen_forward(
             group,
-            q.view(-1,  nheads_k, head_dim),
+            q,
             k,
             v,
             cu_seqlens_q,
@@ -287,6 +288,7 @@ class Llama3FlashAttnFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dout, *args):
         q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k = ctx.saved_tensors
+        batch_k, seq_k, nheads_k, head_dim = k.shape
         dq, dk, dv = llama3_flash_attn_varlen_backward(
             ctx.group,
             dout,
