@@ -330,8 +330,8 @@ def llama3_flash_attn_func(
                               dtype=torch.int32, device=k.device)
     (cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, local_k_slice
     ) = llama3_flash_attn_prepare_cu_seqlens(cu_seqlens, causal, rank, world_size)
-    logging.debug(f"{cu_seqlens_q}, {cu_seqlens_k}, {max_seqlen_q}, {max_seqlen_k}, {local_k_slice}")
-    logging.debug(f"{cu_seqlens}, {causal}, {rank}, {world_size}")
+    # logging.debug(f"{cu_seqlens_q}, {cu_seqlens_k}, {max_seqlen_q}, {max_seqlen_k}, {local_k_slice}")
+    # logging.debug(f"{cu_seqlens}, {causal}, {rank}, {world_size}")
     q, k, v = [rearrange(t, 'b s h d -> (b s) h d') for t in (q, k, v)]
     # k = k.contiguous().view(-1,  nheads_k, head_dim)
     # v = v.contiguous().view(-1,  nheads_k, head_dim)
