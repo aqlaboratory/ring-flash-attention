@@ -220,7 +220,7 @@ def llama_flash_attn_backward(
         k_i = kv_buffer[0]  #[local_k_slice]
         v_i = kv_buffer[1]  #[local_k_slice]
         dk_i = dkv_buffer[0]  #[local_k_slice]
-        dv_i = dkv_buffer[1][  #local_k_slice]
+        dv_i = dkv_buffer[1]  #[local_k_slice]
 
         # params = get_default_args(_flash_attn_varlen_backward).copy()
         params = {
