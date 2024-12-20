@@ -534,7 +534,7 @@ def llama3_flash_attn_varlen_custom_func(
                 out, mesh, [distp_tensor.Shard(0)]
             ).redistribute(mesh, [distp_tensor.Replicate()]).view(batch_k, seq_k, nheads_k, head_dim
             ).redistribute(mesh, [distp_tensor.Shard(1)]).to_local() 
-            return out, softmax_lse, none
+        return out, softmax_lse, none
     else:
         output = distp_tensor.DTensor.from_local(
                 output, mesh, [distp_tensor.Shard(0)]
