@@ -330,7 +330,7 @@ class LlamaRingFlashAttnFunc(torch.autograd.Function):
         # return dq, dk, dv, None, None, None, None, None, None, None, None
         return dq, dk, dv, None, None, None, None, None, None, None, None, None
 
-class Llama3FlashAttnFunc(torch.autograd.Function):
+class LlamaFlashAttnFunc(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
@@ -429,6 +429,35 @@ def llama_fwd_ring_bwd_flash_attn_func(
         group,
     )
 
+def llama_flash_attn_func(
+    q,
+    k,
+    v,
+    heads_k_stride=1,  # default 1 always works, but need optimize
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),
+    alibi_slopes=None,
+    deterministic=False,
+    return_attn_probs=False,
+    group=None,
+):
+    return LlamaFlashAttnFunc.apply(
+        q,
+        k,
+        v,
+        heads_k_stride,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size,
+        alibi_slopes,
+        deterministic,
+        return_attn_probs,
+        group,
+    )
+
 from .llama3_flash_attn_varlen import llama3_flash_attn_varlen_backward, llama3_flash_attn_varlen_forward, llama3_flash_attn_prepare_cu_seqlens, Llama3FlashAttnVarlenFunc
 
 
@@ -463,8 +492,8 @@ def llama3_flash_attn_varlen_custom_func(
         q_k_v.append(
             distp_tensor.DTensor.from_local(
                 t, mesh, [distp_tensor.Shard(1)]
-            ).redistribute(mesh, [distp_tensor.Replicate()).view(-1, nheads_k, head_dim
-            ).redistribute(mesh, [distp_tensor.Shard(0)).to_local() 
+            ).redistribute(mesh, [distp_tensor.Replicate()]).view(-1, nheads_k, head_dim
+            ).redistribute(mesh, [distp_tensor.Shard(0)]).to_local() 
         )
     q, k, v = q_k_v
     world_size = dist.get_world_size(group=group)
@@ -503,12 +532,12 @@ def llama3_flash_attn_varlen_custom_func(
         (out, softmax_lse, none) = output
         out = distp_tensor.DTensor.from_local(
                 out, mesh, [distp_tensor.Shard(0)]
-            ).redistribute(mesh, [distp_tensor.Replicate()).view(batch_k, seq_k, nheads_k, head_dim
-            ).redistribute(mesh, [distp_tensor.Shard(1)).to_local() 
+            ).redistribute(mesh, [distp_tensor.Replicate()]).view(batch_k, seq_k, nheads_k, head_dim
+            ).redistribute(mesh, [distp_tensor.Shard(1)]).to_local() 
             return out, softmax_lse, none
     else:
         output = distp_tensor.DTensor.from_local(
                 output, mesh, [distp_tensor.Shard(0)]
-            ).redistribute(mesh, [distp_tensor.Replicate()).view(batch_k, seq_k, nheads_k, head_dim
-            ).redistribute(mesh, [distp_tensor.Shard(1)).to_local() 
+            ).redistribute(mesh, [distp_tensor.Replicate()]).view(batch_k, seq_k, nheads_k, head_dim
+            ).redistribute(mesh, [distp_tensor.Shard(1)]).to_local() 
         return output
