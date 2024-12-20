@@ -4,6 +4,7 @@ from flash_attn.flash_attn_interface import _flash_attn_forward
 from .ring_flash_attn import ring_flash_attn_backward
 from einops import rearrange
 import logging
+import torch.distributed._tensor as distp_tensor
 
 class AsyncHandles:
 
