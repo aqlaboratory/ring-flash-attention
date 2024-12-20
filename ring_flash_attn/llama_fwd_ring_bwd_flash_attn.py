@@ -1,6 +1,6 @@
 import torch
 import torch.distributed as dist
-from flash_attn.flash_attn_interface import _flash_attn_forward
+from flash_attn.flash_attn_interface import _flash_attn_forward, _flash_attn_backward
 from .ring_flash_attn import ring_flash_attn_backward
 from einops import rearrange
 import logging
