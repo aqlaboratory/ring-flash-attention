@@ -371,6 +371,7 @@ class LlamaFlashAttnFunc(torch.autograd.Function):
         # this should be out_padded
         ctx.save_for_backward(q, k, v, out, softmax_lse)
         ctx.dropout_p = dropout_p
+        ctx.heads_k_stride = heads_k_stride
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
@@ -390,6 +391,7 @@ class LlamaFlashAttnFunc(torch.autograd.Function):
             v,
             out,
             softmax_lse,
+            heads_k_stride=ctx.heads_k_stride,
             softmax_scale=ctx.softmax_scale,
             dropout_p=ctx.dropout_p,
             causal=ctx.causal,
