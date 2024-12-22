@@ -139,7 +139,7 @@ def llama_flash_attn_backward(
     alibi_slopes=None,
     deterministic=False,
 ):
-    nheads = q.shape[1]
+    nheads = q.shape[2]
     batch_k, seq_k, nheads_k, head_dim = k.shape
     assert nheads_k % heads_k_stride == 0
 
