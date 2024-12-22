@@ -2,6 +2,7 @@ import torch
 import torch.distributed as dist
 from flash_attn.flash_attn_interface import _flash_attn_forward, _flash_attn_backward
 from .utils import RingComm, update_out_and_lse, get_default_args
+import logging
 
 
 def ring_flash_attn_forward(
@@ -114,6 +115,8 @@ def ring_flash_attn_backward(
                 "alibi_slopes": alibi_slopes,
                 "deterministic": deterministic,
             }
+            logging.debug(params)
+            logging.debug(f"q {q.shape} k {k.shape} v {v.shape} dout {dout.shape}")            
             _flash_attn_backward(**params)
 
             if dq is None:
