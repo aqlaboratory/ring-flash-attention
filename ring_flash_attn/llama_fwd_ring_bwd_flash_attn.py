@@ -156,7 +156,7 @@ def llama_flash_attn_backward(
         dtype=k.dtype,
         device=k.device,
     )
-    logging.debug(f"softmax_lse {softmax_lse} {softmax_lse.shape}")     
+    # logging.debug(f"softmax_lse {softmax_lse} {softmax_lse.shape}")     
 
     if heads_k_stride != nheads_k:
         kv_contiguous_buffer = torch.empty(
@@ -194,10 +194,10 @@ def llama_flash_attn_backward(
         dout_i = dout[:, :, q_slice]
         out_i = out[:, :, q_slice]
         dq_i = dq[:, :, q_slice]
-        if softmax_lse.dim() == 4:
-            lse_i = softmax_lse[:, :, q_slice].contiguous()
+        if softmax_lse.dim() == 3:
+            lse_i = softmax_lse[:, q_slice].contiguous()
         else:
-            lse_i = softmax_lse[:, q_slice]
+            lse_i = softmax_lse[q_slice]
 
         async_handles.wait()
         kv_buffer, kv_buffer_copy = kv_buffer_copy, kv_buffer

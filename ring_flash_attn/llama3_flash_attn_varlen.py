@@ -5,7 +5,6 @@ from flash_attn.flash_attn_interface import (
     _flash_attn_varlen_backward,
 )
 from .utils import get_default_args
-import logging
 
 class AsyncHandles:
 
@@ -172,7 +171,7 @@ def llama3_flash_attn_varlen_backward(
     k,
     v,
     out,
-    softmax_lse,
+    softmax_lse,  # (h, total)
     cu_seqlens_q,
     cu_seqlens_k,
     max_seqlen_q,
@@ -204,7 +203,6 @@ def llama3_flash_attn_varlen_backward(
         dtype=k.dtype,
         device=k.device,
     )
-    logging.debug(f"softmax_lse {softmax_lse} {softmax_lse.shape}")     
 
     if heads_k_stride != nheads_k:
         kv_contiguous_buffer = torch.empty(
