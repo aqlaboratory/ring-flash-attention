@@ -115,8 +115,7 @@ def ring_flash_attn_backward(
                 "alibi_slopes": alibi_slopes,
                 "deterministic": deterministic,
             }
-            # logging.debug(params)
-            logging.debug(f"q {params['q'].shape} k {params['k'].shape} v {params['v'].shape} dout {params['dout'].shape} softmax_lse {params['softmax_lse'].shape}")            
+            # logging.debug(f"q {params['q'].shape} k {params['k'].shape} v {params['v'].shape} dout {params['dout'].shape} softmax_lse {params['softmax_lse'].shape}")            
             _flash_attn_backward(**params)
 
             if dq is None:
