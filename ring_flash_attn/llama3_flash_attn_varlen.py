@@ -5,6 +5,7 @@ from flash_attn.flash_attn_interface import (
     _flash_attn_varlen_backward,
 )
 from .utils import get_default_args
+import logging
 
 class AsyncHandles:
 
@@ -80,6 +81,7 @@ def llama3_flash_attn_varlen_forward(
 ):
     out_list = []
     lse_list = []
+    logging.debug(f"fwd q {q[:2,0,:3]}")     
 
     nheads = q.shape[1]
     total_k, nheads_k, head_dim = k.shape
@@ -133,6 +135,7 @@ def llama3_flash_attn_varlen_forward(
         q_i = q[:, i * nheads // nheads_k : (i + heads_k_stride) * nheads // nheads_k]
         k_i = kv_buffer[0][local_k_slice]
         v_i = kv_buffer[1][local_k_slice]
+        logging.debug(f"fwd i {i} k_ishape {k_i.shape} q.shape {q.shape} kv_buffer[0] {kv_buffer[0].shape} local_k_slice {local_k_slice}")     
 
         # params = get_default_args(_flash_attn_varlen_forward).copy()
         params = {
@@ -264,11 +267,11 @@ def llama3_flash_attn_varlen_backward(
                     kv_buffer_copy[1], send_v, group=process_group, async_op=True
                 )
             )
-
         k_i = kv_buffer[0][local_k_slice]
         v_i = kv_buffer[1][local_k_slice]
         dk_i = dkv_buffer[0][local_k_slice]
         dv_i = dkv_buffer[1][local_k_slice]
+        logging.debug(f"bwd i {i} q_slice {q_slice} k_ishape {k_i.shape} dv_i.shape {dv_i.shape} q.shape {q.shape}")  
 
         # params = get_default_args(_flash_attn_varlen_backward).copy()
         params = {
@@ -361,6 +364,7 @@ class Llama3FlashAttnVarlenFunc(torch.autograd.Function):
             deterministic=False,
         )
         # this should be out_padded
+        logging.debug(f"q {q.view(-1, 2048, 8, 64)[0,:2,:3,:4]} out {out.view(-1, 2048, 8, 64)[0,:2,:3,:4]} softmax_lse {softmax_lse.view(8, -1, 2048)[0,:2,:4]}")     
         ctx.save_for_backward(q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k)
         ctx.max_seqlen_q = max_seqlen_q
         ctx.max_seqlen_k = max_seqlen_k

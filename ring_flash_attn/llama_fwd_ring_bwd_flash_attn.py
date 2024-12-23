@@ -5,6 +5,13 @@ from .ring_flash_attn import ring_flash_attn_backward
 from einops import rearrange
 import logging
 import torch.distributed._tensor as distp_tensor
+import flash_attn
+import os
+
+if torch.__version__ >= "2.4.0":
+    _wrapped_flash_attn_forward = torch.ops.flash_attn._flash_attn_forward
+else:
+    _wrapped_flash_attn_forward = _flash_attn_forward
 
 class AsyncHandles:
 
@@ -37,6 +44,119 @@ def llama_flash_attn_forward(
 ):
     out_list = []
     lse_list = []
+    # logging.debug(f"bwd q {q[0,:2,0,:3]}")     
+
+    nheads = q.shape[2]
+    # total_k, nheads_k, head_dim = k.shape
+    batch_k, seq_k, nheads_k, head_dim = k.shape
+    assert nheads_k % heads_k_stride == 0
+
+    world_size = dist.get_world_size(process_group)
+
+    gather_tensor = torch.empty(
+        # (2, total_k * world_size, heads_k_stride, head_dim),
+        (batch_k, seq_k, heads_k_stride, head_dim),  # this scrambles output 
+        dtype=k.dtype,
+        device=k.device,
+    )    # rank = dist.get_rank(self._process_group)
+    # logging.debug(process_group
+
+    k_buffer = [torch.empty_like(gather_tensor) for _ in range(world_size)]
+    v_buffer = [torch.empty_like(gather_tensor) for _ in range(world_size)]
+    k_buffer_copy = [torch.empty_like(gather_tensor) for _ in range(world_size)]
+    v_buffer_copy = [torch.empty_like(gather_tensor) for _ in range(world_size)]
+
+    k_0 = k[:, :, :heads_k_stride].contiguous()
+    v_0 = v[:, :, :heads_k_stride].contiguous()
+    async_handles = AsyncHandles()
+
+    async_handles.register(
+        dist.all_gather(
+            k_buffer_copy, k_0, group=process_group, async_op=True
+        )
+    )
+    async_handles.register(
+        dist.all_gather(
+            v_buffer_copy, v_0, group=process_group, async_op=True
+        )
+    )
+
+    for i in range(0, nheads_k, heads_k_stride):
+        async_handles.wait()
+        k_buffer, k_buffer_copy = k_buffer_copy, k_buffer
+        v_buffer, v_buffer_copy = v_buffer_copy, v_buffer
+
+        if i < nheads_k - heads_k_stride:
+            # all_gather the next kv slice
+            kv_slice_left = i + heads_k_stride
+            kv_slice_right = kv_slice_left + heads_k_stride
+            send_k = k[:,:,  kv_slice_left:kv_slice_right].contiguous()
+            send_v = v[:,:,  kv_slice_left:kv_slice_right].contiguous()
+            async_handles.register(
+                dist.all_gather(
+                    k_buffer_copy, send_k, group=process_group, async_op=True
+                )
+            )
+            async_handles.register(
+                dist.all_gather(
+                    v_buffer_copy, send_v, group=process_group, async_op=True
+                )
+            )
+
+        q_i = q[:, :, i * nheads // nheads_k : (i + heads_k_stride) * nheads // nheads_k]
+        k_i = torch.cat(k_buffer, dim=1)
+        v_i = torch.cat(v_buffer, dim=1)
+
+        # params = get_default_args(_flash_attn_varlen_forward).copy()
+        params = {
+            "q": q_i,
+            "k": k_i,
+            "v": v_i,
+            "dropout_p": dropout_p,
+            "softmax_scale": softmax_scale,
+            "causal": causal and step == 0,
+            "window_size_left": window_size[0],
+            "window_size_right": window_size[1],
+            "softcap": softcap,
+            "alibi_slopes": alibi_slopes,
+            "return_softmax": True and dropout_p > 0,
+        }
+        # logging.debug(f"fwd i {i} k_ishape {k_i.shape} s{k_i[0,:3,0,:2]} e{k_i[0,-3:,0,:2]} q_i.shape {q_i.shape} params {params}")     
+        # process_id = os.getpid()
+        # if not os.path.exists('./logging/k_buffer_{}.pt'.format(process_id)):
+        #     torch.save(k_i.detach(), './logging/k_buffer_{}.pt'.format(process_id))
+        # if not os.path.exists('./logging/v_buffer_{}.pt'.format(process_id)):
+        #     torch.save(v_i.detach(), './logging/v_buffer_{}.pt'.format(process_id))
+        # out, _, _, _, _, lse, _, _ = _flash_attn_varlen_forward(**params)
+        out, lse, _, _ = _wrapped_flash_attn_forward(**params)
+        out_list.append(out)
+        lse_list.append(lse)
+
+    # out = torch.cat(out_list, dim=1)
+    out = torch.cat(out_list, dim=2)
+    # lse (B H S)
+    lse = torch.cat(lse_list, dim=-2)
+    return out, lse
+
+
+def llama_flash_attn_scambled_forward(  # need to fix all_gather_into_tensor scrambing output
+    process_group,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    heads_k_stride,
+    # local_k_slice,  # k slice is only meant for var_len (q_local only attend to k_slice)
+    softmax_scale,
+    dropout_p=0,
+    causal=True,
+    window_size=(-1, -1),
+    softcap=0.0,
+    alibi_slopes=None,
+    deterministic=False,
+):
+    out_list = []
+    lse_list = []
+    # logging.debug(f"bwd q {q[0,:2,0,:3]}")     
 
     nheads = q.shape[2]
     # total_k, nheads_k, head_dim = k.shape
@@ -46,10 +166,12 @@ def llama_flash_attn_forward(
     world_size = dist.get_world_size(process_group)
     kv_buffer = torch.empty(
         # (2, total_k * world_size, heads_k_stride, head_dim),
-        (2, batch_k, seq_k * world_size, heads_k_stride, head_dim),
+        (2, batch_k, seq_k * world_size, heads_k_stride, head_dim),  # this scrambles output 
         dtype=k.dtype,
         device=k.device,
     )
+    # rank = dist.get_rank(self._process_group)
+    # logging.debug(process_group
 
     kv_buffer_copy = torch.empty_like(kv_buffer)
 
@@ -94,7 +216,6 @@ def llama_flash_attn_forward(
         q_i = q[:, :, i * nheads // nheads_k : (i + heads_k_stride) * nheads // nheads_k]
         k_i = kv_buffer[0]#[local_k_slice]
         v_i = kv_buffer[1]#[local_k_slice]
-        logging.debug(f"fwd i {i} q_slice {q_slice} kshape {k.shape} dv.shape {dv.shape}")     
 
         # params = get_default_args(_flash_attn_varlen_forward).copy()
         params = {
@@ -110,8 +231,12 @@ def llama_flash_attn_forward(
             "alibi_slopes": alibi_slopes,
             "return_softmax": True and dropout_p > 0,
         }
+  
+        # process_id = os.getpid()
+        # if not os.path.exists('./logging/kv_buffer_{}.pt'.format(process_id)):
+        #     torch.save(kv_buffer.detach(), './logging/kv_buffer_{}.pt'.format(process_id))
         # out, _, _, _, _, lse, _, _ = _flash_attn_varlen_forward(**params)
-        out, lse, _, _ = _flash_attn_forward(**params)
+        out, lse, _, _ = _wrapped_flash_attn_forward(**params)
         out_list.append(out)
         lse_list.append(lse)
 
@@ -120,8 +245,8 @@ def llama_flash_attn_forward(
     # lse (B H S)
     lse = torch.cat(lse_list, dim=-2)
     return out, lse
-
-
+    
+    
 def llama_flash_attn_backward(
     process_group,
     dout,
@@ -142,6 +267,7 @@ def llama_flash_attn_backward(
     nheads = q.shape[2]
     batch_k, seq_k, nheads_k, head_dim = k.shape
     assert nheads_k % heads_k_stride == 0
+    # logging.debug(f"bwd q {q[0,:2,0,:3]}")     
 
     world_size = dist.get_world_size(process_group)
     kv_buffer = torch.empty(
@@ -200,7 +326,7 @@ def llama_flash_attn_backward(
 
         async_handles.wait()
         kv_buffer, kv_buffer_copy = kv_buffer_copy, kv_buffer
-        logging.debug(f"bwd i {i} q_slice {q_slice} kshape {k.shape} dv.shape {dv.shape}")     
+        # logging.debug(f"bwd i {i} q_slice {q_slice} kshape {k.shape} dv.shape {dv.shape} q.shape {q.shape}")     
 
         if i < nheads_k - heads_k_stride:
             # all_gather the next kv slice
@@ -301,6 +427,7 @@ class LlamaRingFlashAttnFunc(torch.autograd.Function):
             alibi_slopes=alibi_slopes,
             deterministic=False,
         )
+        # logging.debug(f"out {out[0,:2,3,:4]} out {softmax_lse[0,:2,:5]}")     
         # this should be out_padded
         ctx.save_for_backward(q, k, v, out, softmax_lse)
         ctx.dropout_p = dropout_p
@@ -323,7 +450,7 @@ class LlamaRingFlashAttnFunc(torch.autograd.Function):
             v,
             out,
             softmax_lse,
-            heads_k_stride=ctx.heads_k_stride,
+            # heads_k_stride=ctx.heads_k_stride,
             softmax_scale=ctx.softmax_scale,
             dropout_p=ctx.dropout_p,
             causal=ctx.causal,
@@ -354,7 +481,6 @@ class LlamaFlashAttnFunc(torch.autograd.Function):
     ):
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
-
         assert alibi_slopes is None
         k = k.contiguous()
         v = v.contiguous()
@@ -371,6 +497,7 @@ class LlamaFlashAttnFunc(torch.autograd.Function):
             alibi_slopes=alibi_slopes,
             deterministic=False,
         )
+        logging.debug(f"out {out[0,:2,3,:4]} softmax_lse {softmax_lse[0,:2,:5]}")     
         # this should be out_padded
         ctx.save_for_backward(q, k, v, out, softmax_lse)
         ctx.dropout_p = dropout_p
@@ -449,6 +576,7 @@ def llama_flash_attn_func(
     return_attn_probs=False,
     group=None,
 ):
+    # logging.debug(f"q {q[0,:2,3,:4]}")
     return LlamaFlashAttnFunc.apply(
         q,
         k,
@@ -493,6 +621,7 @@ def llama3_flash_attn_varlen_custom_func(
     inefficient all gather just a temp fix for testing
     '''
     batch_k, seq_k, nheads_k, head_dim = k.shape
+    # logging.debug(f"q {q[0,:2,3,:4]}")
     q_k_v = []
     for t in (q, k, v):
         q_k_v.append(
@@ -533,7 +662,6 @@ def llama3_flash_attn_varlen_custom_func(
         return_attn_probs,
         group,
     )
-
     if return_attn_probs:
         (out, softmax_lse, none) = output
         out = distp_tensor.DTensor.from_local(
@@ -546,4 +674,5 @@ def llama3_flash_attn_varlen_custom_func(
                 output, mesh, [distp_tensor.Shard(0)]
             ).redistribute(mesh, [distp_tensor.Replicate()]).view(batch_k, seq_k*world_size, nheads_k, head_dim
             ).redistribute(mesh, [distp_tensor.Shard(1)]).to_local() 
+        logging.debug(f" out {output[0,:2,3,:4]}")     
         return output
