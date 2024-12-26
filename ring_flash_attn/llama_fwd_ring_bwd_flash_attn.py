@@ -72,8 +72,8 @@ def llama_flash_attn_forward(
         device=k.device,
     )
     kv_buffer_copy = torch.empty_like(kv_buffer)
-    k_buffer, v_buffer = kv_buffer[0].unbind(dim=2), kv_buffer[1].unbind(dim=2)
-    k_buffer_copy, v_buffer_copy = kv_buffer_copy[0].unbind(dim=2), kv_buffer_copy[1].unbind(dim=2)
+    k_buffer, v_buffer = list(kv_buffer[0].unbind(dim=2)), list(kv_buffer[1].unbind(dim=2))
+    k_buffer_copy, v_buffer_copy = list(kv_buffer_copy[0].unbind(dim=2)), list(kv_buffer_copy[1].unbind(dim=2))
 
     
     k_0 = k[:, :, :heads_k_stride].contiguous()
