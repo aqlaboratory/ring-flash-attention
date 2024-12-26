@@ -53,19 +53,29 @@ def llama_flash_attn_forward(
 
     world_size = dist.get_world_size(process_group)
 
-    gather_tensor = torch.empty(
-        # (2, total_k * world_size, heads_k_stride, head_dim),
-        (batch_k, seq_k, heads_k_stride, head_dim),  # this scrambles output 
+    # gather_tensor = torch.empty(
+    #     # (2, total_k * world_size, heads_k_stride, head_dim),
+    #     (batch_k, seq_k, heads_k_stride, head_dim),  # this scrambles output 
+    #     dtype=k.dtype,
+    #     device=k.device,
+    # )    # rank = dist.get_rank(self._process_group)
+    # # logging.debug(process_group
+
+    # k_buffer = [torch.empty_like(gather_tensor) for _ in range(world_size)]
+    # v_buffer = [torch.empty_like(gather_tensor) for _ in range(world_size)]
+    # k_buffer_copy = [torch.empty_like(gather_tensor) for _ in range(world_size)]
+    # v_buffer_copy = [torch.empty_like(gather_tensor) for _ in range(world_size)]
+
+    kv_buffer = torch.empty(
+        (2, batch_k, seq_k, world_size, heads_k_stride, head_dim),
         dtype=k.dtype,
         device=k.device,
-    )    # rank = dist.get_rank(self._process_group)
-    # logging.debug(process_group
+    )
+    kv_buffer_copy = torch.empty_like(kv_buffer)
+    k_buffer, v_buffer = kv_buffer[0].unbind(dim=2), kv_buffer[1].unbind(dim=2)
+    k_buffer_copy, v_buffer_copy = kv_buffer_copy[0].unbind(dim=2), kv_buffer_copy[1].unbind(dim=2)
 
-    k_buffer = [torch.empty_like(gather_tensor) for _ in range(world_size)]
-    v_buffer = [torch.empty_like(gather_tensor) for _ in range(world_size)]
-    k_buffer_copy = [torch.empty_like(gather_tensor) for _ in range(world_size)]
-    v_buffer_copy = [torch.empty_like(gather_tensor) for _ in range(world_size)]
-
+    
     k_0 = k[:, :, :heads_k_stride].contiguous()
     v_0 = v[:, :, :heads_k_stride].contiguous()
     async_handles = AsyncHandles()
