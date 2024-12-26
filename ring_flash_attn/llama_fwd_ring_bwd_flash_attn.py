@@ -135,8 +135,6 @@ def llama_flash_attn_forward(
         # process_id = os.getpid()
         # if not os.path.exists('./logging/k_buffer_{}.pt'.format(process_id)):
         #     torch.save(k_i.detach(), './logging/k_buffer_{}.pt'.format(process_id))
-        # if not os.path.exists('./logging/v_buffer_{}.pt'.format(process_id)):
-        #     torch.save(v_i.detach(), './logging/v_buffer_{}.pt'.format(process_id))
         # out, _, _, _, _, lse, _, _ = _flash_attn_varlen_forward(**params)
         out, lse, _, _ = _wrapped_flash_attn_forward(**params)
         out_list.append(out)
@@ -149,112 +147,108 @@ def llama_flash_attn_forward(
     return out, lse
 
 
-def llama_flash_attn_scambled_forward(  # need to fix all_gather_into_tensor scrambing output
-    process_group,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    heads_k_stride,
-    # local_k_slice,  # k slice is only meant for var_len (q_local only attend to k_slice)
-    softmax_scale,
-    dropout_p=0,
-    causal=True,
-    window_size=(-1, -1),
-    softcap=0.0,
-    alibi_slopes=None,
-    deterministic=False,
-):
-    out_list = []
-    lse_list = []
-    # logging.debug(f"bwd q {q[0,:2,0,:3]}")     
+# def llama_flash_attn_forward(  # need to fix all_gather_into_tensor scrambing output
+#     process_group,
+#     q: torch.Tensor,
+#     k: torch.Tensor,
+#     v: torch.Tensor,
+#     heads_k_stride,
+#     # local_k_slice,  # k slice is only meant for var_len (q_local only attend to k_slice)
+#     softmax_scale,
+#     dropout_p=0,
+#     causal=True,
+#     window_size=(-1, -1),
+#     softcap=0.0,
+#     alibi_slopes=None,
+#     deterministic=False,
+# ):
+#     out_list = []
+#     lse_list = []
+#     # logging.debug(f"bwd q {q[0,:2,0,:3]}")     
 
-    nheads = q.shape[2]
-    # total_k, nheads_k, head_dim = k.shape
-    batch_k, seq_k, nheads_k, head_dim = k.shape
-    assert nheads_k % heads_k_stride == 0
+#     nheads = q.shape[2]
+#     # total_k, nheads_k, head_dim = k.shape
+#     batch_k, seq_k, nheads_k, head_dim = k.shape
+#     assert nheads_k % heads_k_stride == 0
 
-    world_size = dist.get_world_size(process_group)
-    kv_buffer = torch.empty(
-        # (2, total_k * world_size, heads_k_stride, head_dim),
-        (2, batch_k, seq_k * world_size, heads_k_stride, head_dim),  # this scrambles output 
-        dtype=k.dtype,
-        device=k.device,
-    )
-    # rank = dist.get_rank(self._process_group)
-    # logging.debug(process_group
+#     world_size = dist.get_world_size(process_group)
+#     kv_buffer = torch.empty(
+#         # (2, total_k * world_size, heads_k_stride, head_dim),
+#         (2, batch_k, seq_k * world_size, heads_k_stride, head_dim),  # this scrambles output 
+#         dtype=k.dtype,
+#         device=k.device,
+#     )
+#     # rank = dist.get_rank(self._process_group)
+#     # logging.debug(process_group
 
-    kv_buffer_copy = torch.empty_like(kv_buffer)
+#     kv_buffer_copy = torch.empty_like(kv_buffer)
 
-    # k_0 = k[:, :heads_k_stride].contiguous()
-    # v_0 = v[:, :heads_k_stride].contiguous()
-    k_0 = k[:, :, :heads_k_stride].contiguous()
-    v_0 = v[:, :, :heads_k_stride].contiguous()
-    async_handles = AsyncHandles()
+#     # k_0 = k[:, :heads_k_stride].contiguous()
+#     # v_0 = v[:, :heads_k_stride].contiguous()
+#     k_0 = k[:, :, :heads_k_stride].contiguous()
+#     v_0 = v[:, :, :heads_k_stride].contiguous()
+#     async_handles = AsyncHandles()
 
-    async_handles.register(
-        dist.all_gather_into_tensor(
-            kv_buffer_copy[0], k_0, group=process_group, async_op=True
-        )
-    )
-    async_handles.register(
-        dist.all_gather_into_tensor(
-            kv_buffer_copy[1], v_0, group=process_group, async_op=True
-        )
-    )
+#     async_handles.register(
+#         dist.all_gather_into_tensor(
+#             kv_buffer_copy[0], k_0, group=process_group, async_op=True
+#         )
+#     )
+#     async_handles.register(
+#         dist.all_gather_into_tensor(
+#             kv_buffer_copy[1], v_0, group=process_group, async_op=True
+#         )
+#     )
 
-    for i in range(0, nheads_k, heads_k_stride):
-        async_handles.wait()
-        kv_buffer, kv_buffer_copy = kv_buffer_copy, kv_buffer
+#     for i in range(0, nheads_k, heads_k_stride):
+#         async_handles.wait()
+#         kv_buffer, kv_buffer_copy = kv_buffer_copy, kv_buffer
 
-        if i < nheads_k - heads_k_stride:
-            # all_gather the next kv slice
-            kv_slice_left = i + heads_k_stride
-            kv_slice_right = kv_slice_left + heads_k_stride
-            send_k = k[:,:,  kv_slice_left:kv_slice_right].contiguous()
-            send_v = v[:,:,  kv_slice_left:kv_slice_right].contiguous()
-            async_handles.register(
-                dist.all_gather_into_tensor(
-                    kv_buffer_copy[0], send_k, group=process_group, async_op=True
-                )
-            )
-            async_handles.register(
-                dist.all_gather_into_tensor(
-                    kv_buffer_copy[1], send_v, group=process_group, async_op=True
-                )
-            )
+#         if i < nheads_k - heads_k_stride:
+#             # all_gather the next kv slice
+#             kv_slice_left = i + heads_k_stride
+#             kv_slice_right = kv_slice_left + heads_k_stride
+#             send_k = k[:,:,  kv_slice_left:kv_slice_right].contiguous()
+#             send_v = v[:,:,  kv_slice_left:kv_slice_right].contiguous()
+#             async_handles.register(
+#                 dist.all_gather_into_tensor(
+#                     kv_buffer_copy[0], send_k, group=process_group, async_op=True
+#                 )
+#             )
+#             async_handles.register(
+#                 dist.all_gather_into_tensor(
+#                     kv_buffer_copy[1], send_v, group=process_group, async_op=True
+#                 )
+#             )
 
-        q_i = q[:, :, i * nheads // nheads_k : (i + heads_k_stride) * nheads // nheads_k]
-        k_i = kv_buffer[0]#[local_k_slice]
-        v_i = kv_buffer[1]#[local_k_slice]
+#         q_i = q[:, :, i * nheads // nheads_k : (i + heads_k_stride) * nheads // nheads_k]
+#         k_i = kv_buffer[0]#[local_k_slice]
+#         v_i = kv_buffer[1]#[local_k_slice]
 
-        # params = get_default_args(_flash_attn_varlen_forward).copy()
-        params = {
-            "q": q_i,
-            "k": k_i,
-            "v": v_i,
-            "dropout_p": dropout_p,
-            "softmax_scale": softmax_scale,
-            "causal": causal and step == 0,
-            "window_size_left": window_size[0],
-            "window_size_right": window_size[1],
-            "softcap": softcap,
-            "alibi_slopes": alibi_slopes,
-            "return_softmax": True and dropout_p > 0,
-        }
-  
-        # process_id = os.getpid()
-        # if not os.path.exists('./logging/kv_buffer_{}.pt'.format(process_id)):
-        #     torch.save(kv_buffer.detach(), './logging/kv_buffer_{}.pt'.format(process_id))
-        # out, _, _, _, _, lse, _, _ = _flash_attn_varlen_forward(**params)
-        out, lse, _, _ = _wrapped_flash_attn_forward(**params)
-        out_list.append(out)
-        lse_list.append(lse)
+#         # params = get_default_args(_flash_attn_varlen_forward).copy()
+#         params = {
+#             "q": q_i,
+#             "k": k_i,
+#             "v": v_i,
+#             "dropout_p": dropout_p,
+#             "softmax_scale": softmax_scale,
+#             "causal": causal and step == 0,
+#             "window_size_left": window_size[0],
+#             "window_size_right": window_size[1],
+#             "softcap": softcap,
+#             "alibi_slopes": alibi_slopes,
+#             "return_softmax": True and dropout_p > 0,
+#         }
+#         # out, _, _, _, _, lse, _, _ = _flash_attn_varlen_forward(**params)
+#         out, lse, _, _ = _wrapped_flash_attn_forward(**params)
+#         out_list.append(out)
+#         lse_list.append(lse)
 
-    # out = torch.cat(out_list, dim=1)
-    out = torch.cat(out_list, dim=2)
-    # lse (B H S)
-    lse = torch.cat(lse_list, dim=-2)
-    return out, lse
+#     # out = torch.cat(out_list, dim=1)
+#     out = torch.cat(out_list, dim=2)
+#     # lse (B H S)
+#     lse = torch.cat(lse_list, dim=-2)
+#     return out, lse
     
     
 def llama_flash_attn_backward(
