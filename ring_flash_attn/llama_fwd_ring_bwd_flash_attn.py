@@ -279,15 +279,15 @@ def llama_flash_attn_backward(
     assert nheads_k % heads_k_stride == 0
 
     world_size = dist.get_world_size(process_group)
-    gather_tensor = torch.empty(
-        (batch_k, seq_k, heads_k_stride, head_dim),
+    
+    kv_buffer = torch.empty(
+        (2, batch_k, seq_k, world_size, heads_k_stride, head_dim),
         dtype=k.dtype,
         device=k.device,
     )
-    k_buffer = [torch.empty_like(gather_tensor) for _ in range(world_size)]
-    v_buffer = [torch.empty_like(gather_tensor) for _ in range(world_size)]
-    k_buffer_copy = torch.empty_like(k_buffer)
-    v_buffer_copy = torch.empty_like(v_buffer)
+    kv_buffer_copy = torch.empty_like(kv_buffer)
+    k_buffer, v_buffer = list(kv_buffer[0].unbind(dim=2)), list(kv_buffer[1].unbind(dim=2))
+    k_buffer_copy, v_buffer_copy = list(kv_buffer_copy[0].unbind(dim=2)), list(kv_buffer_copy[1].unbind(dim=2))
 
     dkv_buffer = torch.empty(
         (2, batch_k, seq_k * world_size, heads_k_stride, head_dim),
