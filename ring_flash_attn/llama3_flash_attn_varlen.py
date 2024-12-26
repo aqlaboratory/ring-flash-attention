@@ -81,7 +81,6 @@ def llama3_flash_attn_varlen_forward(
 ):
     out_list = []
     lse_list = []
-    logging.debug(f"fwd q {q[:2,0,:3]}")     
 
     nheads = q.shape[1]
     total_k, nheads_k, head_dim = k.shape

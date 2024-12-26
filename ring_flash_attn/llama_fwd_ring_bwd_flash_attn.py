@@ -267,29 +267,33 @@ def llama_flash_attn_backward(
     nheads = q.shape[2]
     batch_k, seq_k, nheads_k, head_dim = k.shape
     assert nheads_k % heads_k_stride == 0
-    # logging.debug(f"bwd q {q[0,:2,0,:3]}")     
 
     world_size = dist.get_world_size(process_group)
-    kv_buffer = torch.empty(
-        (2, batch_k, seq_k * world_size, heads_k_stride, head_dim),
+    gather_tensor = torch.empty(
+        (batch_k, seq_k, heads_k_stride, head_dim),
         dtype=k.dtype,
         device=k.device,
     )
-    kv_buffer_copy = torch.empty_like(kv_buffer)
+    k_buffer = [torch.empty_like(gather_tensor) for _ in range(world_size)]
+    v_buffer = [torch.empty_like(gather_tensor) for _ in range(world_size)]
+    k_buffer_copy = torch.empty_like(k_buffer)
+    v_buffer_copy = torch.empty_like(v_buffer)
 
     dkv_buffer = torch.empty(
         (2, batch_k, seq_k * world_size, heads_k_stride, head_dim),
         dtype=k.dtype,
         device=k.device,
-    )
+    ) 
 
     if heads_k_stride != nheads_k:
+        # for reduce_scatter_tensor
         kv_contiguous_buffer = torch.empty(
             (2, batch_k, seq_k, heads_k_stride, head_dim),
             dtype=k.dtype,
             device=k.device,
         )
 
+    
     dq = torch.empty_like(q)
     dk = torch.empty_like(k)
     dv = torch.empty_like(v)
@@ -298,14 +302,15 @@ def llama_flash_attn_backward(
 
     k_0 = k[:, :, :heads_k_stride].contiguous()
     v_0 = v[:, :, :heads_k_stride].contiguous()
+
     async_handles.register(
-        dist.all_gather_into_tensor(
-            kv_buffer_copy[0], k_0, group=process_group, async_op=True
+        dist.all_gather(
+            k_buffer_copy, k_0, group=process_group, async_op=True
         )
     )
     async_handles.register(
-        dist.all_gather_into_tensor(
-            kv_buffer_copy[1], v_0, group=process_group, async_op=True
+        dist.all_gather(
+            v_buffer_copy, v_0, group=process_group, async_op=True
         )
     )
 
@@ -335,20 +340,20 @@ def llama_flash_attn_backward(
             send_k = k[:, :, kv_slice_left:kv_slice_right].contiguous()
             send_v = v[:, :, kv_slice_left:kv_slice_right].contiguous()
             async_handles.register(
-                dist.all_gather_into_tensor(
-                    kv_buffer_copy[0], send_k, group=process_group, async_op=True
+                dist.all_gather(
+                    k_buffer_copy, send_k, group=process_group, async_op=True
                 )
             )
             async_handles.register(
-                dist.all_gather_into_tensor(
-                    kv_buffer_copy[1], send_v, group=process_group, async_op=True
+                dist.all_gather(
+                    v_buffer_copy, send_v, group=process_group, async_op=True
                 )
             )
 
-        k_i = kv_buffer[0]  #[local_k_slice]
-        v_i = kv_buffer[1]  #[local_k_slice]
-        dk_i = dkv_buffer[0]  #[local_k_slice]
-        dv_i = dkv_buffer[1]  #[local_k_slice]
+        k_i = torch.cat(k_buffer, dim=1)  #[local_k_slice]
+        v_i = torch.cat(v_buffer, dim=1)  #[local_k_slice]
+        dk_i = dkv_buffer[0]
+        dv_i = dkv_buffer[1]
 
         # params = get_default_args(_flash_attn_varlen_backward).copy()
         params = {
@@ -389,6 +394,149 @@ def llama_flash_attn_backward(
             dv[:, :, i : i + heads_k_stride] = dv_i
 
     return dq, dk, dv
+
+
+# def llama_flash_attn_backward(
+#     process_group,
+#     dout,
+#     q,
+#     k,
+#     v,
+#     out,
+#     softmax_lse,
+#     heads_k_stride,
+#     softmax_scale,
+#     dropout_p=0,
+#     causal=True,
+#     window_size=(-1, -1),
+#     softcap=0.0,
+#     alibi_slopes=None,
+#     deterministic=False,
+# ):
+#     nheads = q.shape[2]
+#     batch_k, seq_k, nheads_k, head_dim = k.shape
+#     assert nheads_k % heads_k_stride == 0
+
+#     world_size = dist.get_world_size(process_group)
+#     kv_buffer = torch.empty(
+#         (2, batch_k, seq_k * world_size, heads_k_stride, head_dim),
+#         dtype=k.dtype,
+#         device=k.device,
+#     )
+#     kv_buffer_copy = torch.empty_like(kv_buffer)
+
+#     dkv_buffer = torch.empty(
+#         (2, batch_k, seq_k * world_size, heads_k_stride, head_dim),
+#         dtype=k.dtype,
+#         device=k.device,
+#     )
+
+#     if heads_k_stride != nheads_k:
+#         kv_contiguous_buffer = torch.empty(
+#             (2, batch_k, seq_k, heads_k_stride, head_dim),
+#             dtype=k.dtype,
+#             device=k.device,
+#         )
+
+#     dq = torch.empty_like(q)
+#     dk = torch.empty_like(k)
+#     dv = torch.empty_like(v)
+
+#     async_handles = AsyncHandles()
+
+#     k_0 = k[:, :, :heads_k_stride].contiguous()
+#     v_0 = v[:, :, :heads_k_stride].contiguous()
+#     async_handles.register(
+#         dist.all_gather_into_tensor(
+#             kv_buffer_copy[0], k_0, group=process_group, async_op=True
+#         )
+#     )
+#     async_handles.register(
+#         dist.all_gather_into_tensor(
+#             kv_buffer_copy[1], v_0, group=process_group, async_op=True
+#         )
+#     )
+
+#     for i in range(0, nheads_k, heads_k_stride):
+#         dkv_buffer.zero_()
+
+#         q_slice = slice(
+#             i * nheads // nheads_k, (i + heads_k_stride) * nheads // nheads_k
+#         )
+#         q_i = q[:, :, q_slice]
+#         dout_i = dout[:, :, q_slice]
+#         out_i = out[:, :, q_slice]
+#         dq_i = dq[:, :, q_slice]
+#         if softmax_lse.dim() == 3:
+#             lse_i = softmax_lse[:, q_slice].contiguous()
+#         else:
+#             lse_i = softmax_lse[q_slice]
+
+#         async_handles.wait()
+#         kv_buffer, kv_buffer_copy = kv_buffer_copy, kv_buffer
+#         # logging.debug(f"bwd i {i} q_slice {q_slice} kshape {k.shape} dv.shape {dv.shape} q.shape {q.shape}")     
+
+#         if i < nheads_k - heads_k_stride:
+#             # all_gather the next kv slice
+#             kv_slice_left = i + heads_k_stride
+#             kv_slice_right = kv_slice_left + heads_k_stride
+#             send_k = k[:, :, kv_slice_left:kv_slice_right].contiguous()
+#             send_v = v[:, :, kv_slice_left:kv_slice_right].contiguous()
+#             async_handles.register(
+#                 dist.all_gather_into_tensor(
+#                     kv_buffer_copy[0], send_k, group=process_group, async_op=True
+#                 )
+#             )
+#             async_handles.register(
+#                 dist.all_gather_into_tensor(
+#                     kv_buffer_copy[1], send_v, group=process_group, async_op=True
+#                 )
+#             )
+
+#         k_i = kv_buffer[0]  #[local_k_slice]
+#         v_i = kv_buffer[1]  #[local_k_slice]
+#         dk_i = dkv_buffer[0]  #[local_k_slice]
+#         dv_i = dkv_buffer[1]  #[local_k_slice]
+
+#         # params = get_default_args(_flash_attn_varlen_backward).copy()
+#         params = {
+#                 "dout": dout_i,
+#                 "q": q_i,
+#                 "k": k_i,
+#                 "v": v_i,
+#                 "out": out_i,
+#                 "softmax_lse": lse_i,
+#                 "dq": dq_i,
+#                 "dk": dk_i,
+#                 "dv": dv_i,
+#                 "dropout_p": dropout_p,
+#                 "softmax_scale": softmax_scale,
+#                 "causal": causal,
+#                 "window_size_left": window_size[0],
+#                 "window_size_right": window_size[1],
+#                 "softcap": softcap,
+#                 "alibi_slopes": alibi_slopes,
+#                 "deterministic": deterministic,
+#         }
+#         # logging.debug(f"i {i} q {params['q'].shape} k {params['k'].shape} v {params['v'].shape} dout {params['dout'].shape} softmax_lse {params['softmax_lse'].shape}")     
+#         _flash_attn_backward(**params)
+
+#         if heads_k_stride != nheads_k:
+#             # reduce_scatter needs contiguous buffer
+#             dk_i = kv_contiguous_buffer[0]
+#             dv_i = kv_contiguous_buffer[1]
+#         else:
+#             dk_i = dk
+#             dv_i = dv
+
+#         dist.reduce_scatter_tensor(dk_i, dkv_buffer[0], group=process_group)
+#         dist.reduce_scatter_tensor(dv_i, dkv_buffer[1], group=process_group)
+
+#         if heads_k_stride != nheads_k:
+#             dk[:, :, i : i + heads_k_stride] = dk_i
+#             dv[:, :, i : i + heads_k_stride] = dv_i
+
+#     return dq, dk, dv
 
 class LlamaRingFlashAttnFunc(torch.autograd.Function):
     @staticmethod
@@ -497,7 +645,7 @@ class LlamaFlashAttnFunc(torch.autograd.Function):
             alibi_slopes=alibi_slopes,
             deterministic=False,
         )
-        logging.debug(f"out {out[0,:2,3,:4]} softmax_lse {softmax_lse[0,:2,:5]}")     
+        # logging.debug(f"out {out[0,:2,3,:4]} softmax_lse {softmax_lse[0,:2,:5]}")     
         # this should be out_padded
         ctx.save_for_backward(q, k, v, out, softmax_lse)
         ctx.dropout_p = dropout_p
