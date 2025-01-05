@@ -8,7 +8,7 @@ import torch.distributed._tensor as distp_tensor
 import flash_attn
 import os
 
-if torch.__version__ >= "2.4.0" and flash_attn.__version__ >= 2.7.0:
+if torch.__version__ >= "2.4.0" and flash_attn.__version__ >= "2.7.0":
     _wrapped_flash_attn_forward = torch.ops.flash_attn._flash_attn_forward
 else:
     _wrapped_flash_attn_forward = _flash_attn_forward
