@@ -41,6 +41,7 @@ def llama_flash_attn_forward(
     softcap=0.0,
     alibi_slopes=None,
     deterministic=False,
+    time_event=None,  # Sync GPU,CPU to lower vRAM allocation; no sync by default
 ):
     out_list = []
     lse_list = []
@@ -92,6 +93,9 @@ def llama_flash_attn_forward(
     )
 
     for i in range(0, nheads_k, heads_k_stride):
+        # Optimization: No sync on last head stride
+        if (i == nheads_k - heads_k_stride) and (time_event is not None):
+            time_event.record()
         async_handles.wait()
         k_buffer, k_buffer_copy = k_buffer_copy, k_buffer
         v_buffer, v_buffer_copy = v_buffer_copy, v_buffer
@@ -313,7 +317,9 @@ class LlamaRingFlashAttnFunc(torch.autograd.Function):
         deterministic,
         return_softmax,
         group,
+        bwd_event_sync,
     ):
+        time_event = torch.cuda.Event(enable_timing=False)
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
 
@@ -332,7 +338,9 @@ class LlamaRingFlashAttnFunc(torch.autograd.Function):
             window_size=window_size,
             alibi_slopes=alibi_slopes,
             deterministic=False,
+            time_event=time_event,
         )
+        time_event.synchronize()
         # logging.debug(f"out {out[0,:2,3,:4]} out {softmax_lse[0,:2,:5]}")     
         # this should be out_padded
         ctx.save_for_backward(q, k, v, out, softmax_lse)
@@ -343,10 +351,14 @@ class LlamaRingFlashAttnFunc(torch.autograd.Function):
         ctx.alibi_slopes = alibi_slopes
         ctx.deterministic = deterministic
         ctx.group = group
+        ctx.bwd_event_sync = bwd_event_sync
         return out if not return_softmax else (out, softmax_lse, None)
 
     @staticmethod
     def backward(ctx, dout, *args):
+        time_event = None
+        if ctx.bwd_event_sync:
+            time_event = torch.cuda.Event(enable_timing=False)
         q, k, v, out, softmax_lse = ctx.saved_tensors
         dq, dk, dv = ring_flash_attn_backward(
             ctx.group,
@@ -363,9 +375,12 @@ class LlamaRingFlashAttnFunc(torch.autograd.Function):
             window_size=ctx.window_size,
             alibi_slopes=ctx.alibi_slopes,
             deterministic=ctx.deterministic,
+            time_event=time_event,
         )
+        if ctx.bwd_event_sync:
+            time_event.synchronize()
         # return dq, dk, dv, None, None, None, None, None, None, None, None
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None
 
 class LlamaFlashAttnFunc(torch.autograd.Function):
     @staticmethod
@@ -452,6 +467,7 @@ def llama_fwd_ring_bwd_flash_attn_func(
     deterministic=False,
     return_attn_probs=False,
     group=None,
+    bwd_event_sync=False,
 ):
     return LlamaRingFlashAttnFunc.apply(
         q,
@@ -466,6 +482,7 @@ def llama_fwd_ring_bwd_flash_attn_func(
         deterministic,
         return_attn_probs,
         group,
+        bwd_event_sync,
     )
 
 def llama_flash_attn_func(

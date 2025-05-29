@@ -3,6 +3,7 @@ import torch.distributed as dist
 from flash_attn.flash_attn_interface import _flash_attn_forward, _flash_attn_backward
 from .utils import RingComm, update_out_and_lse, get_default_args
 import logging
+import gc
 
 
 def ring_flash_attn_forward(
@@ -75,6 +76,7 @@ def ring_flash_attn_backward(
     softcap=0.0,
     alibi_slopes=None,
     deterministic=False,
+    time_event=None,  # Sync GPU,CPU to lower vRAM allocation; no sync by default
 ):
     kv_comm = RingComm(process_group)
     d_kv_comm = RingComm(process_group)
@@ -93,6 +95,8 @@ def ring_flash_attn_backward(
             next_k = kv_comm.send_recv(k)
             next_v = kv_comm.send_recv(v)
             kv_comm.commit()
+        elif time_event is not None:
+            time_event.record()
         if step <= kv_comm.rank or not causal:
             bwd_causal = causal and step == 0
             # params = get_default_args(_flash_attn_backward).copy()
