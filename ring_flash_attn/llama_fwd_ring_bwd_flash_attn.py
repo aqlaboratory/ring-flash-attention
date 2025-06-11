@@ -46,42 +46,28 @@ def llama_flash_attn_forward(
 
     world_size = dist.get_world_size(process_group)
 
-    # gather_tensor = torch.empty(
-    #     # (2, total_k * world_size, heads_k_stride, head_dim),
-    #     (batch_k, seq_k, heads_k_stride, head_dim),  # this scrambles output 
-    #     dtype=k.dtype,
-    #     device=k.device,
-    # )    # rank = dist.get_rank(self._process_group)
-    # # logging.debug(process_group
-
-    # k_buffer = [torch.empty_like(gather_tensor) for _ in range(world_size)]
-    # v_buffer = [torch.empty_like(gather_tensor) for _ in range(world_size)]
-    # k_buffer_copy = [torch.empty_like(gather_tensor) for _ in range(world_size)]
-    # v_buffer_copy = [torch.empty_like(gather_tensor) for _ in range(world_size)]
-
     kv_buffer = torch.empty(
         (2, batch_k, seq_k, world_size, heads_k_stride, head_dim),
         dtype=k.dtype,
         device=k.device,
     )
     kv_buffer_copy = torch.empty_like(kv_buffer)
-    k_buffer, v_buffer = list(kv_buffer[0].unbind(dim=2)), list(kv_buffer[1].unbind(dim=2))
-    k_buffer_copy, v_buffer_copy = list(kv_buffer_copy[0].unbind(dim=2)), list(kv_buffer_copy[1].unbind(dim=2))
 
-    
     k_0 = k[:, :, :heads_k_stride].contiguous()
     v_0 = v[:, :, :heads_k_stride].contiguous()
 
     comm = Comm(process_group)
-    comm.all_gather(k_buffer_copy, k_0)
-    comm.all_gather(v_buffer_copy, v_0)
+    # Pass the main tensor slices to all_gather
+    comm.all_gather(kv_buffer_copy[0], k_0)
+    comm.all_gather(kv_buffer_copy[1], v_0)
+
     for i in range(0, nheads_k, heads_k_stride):
         # Optimization: No sync on last head stride
         if (i == nheads_k - heads_k_stride) and (time_event is not None):
             time_event.record()
         comm.wait()
-        k_buffer, k_buffer_copy = k_buffer_copy, k_buffer
-        v_buffer, v_buffer_copy = v_buffer_copy, v_buffer
+        # Swap the main storage tensors
+        kv_buffer, kv_buffer_copy = kv_buffer_copy, kv_buffer
 
         if i < nheads_k - heads_k_stride:
             # all_gather the next kv slice
@@ -89,12 +75,16 @@ def llama_flash_attn_forward(
             kv_slice_right = kv_slice_left + heads_k_stride
             send_k = k[:,:,  kv_slice_left:kv_slice_right].contiguous()
             send_v = v[:,:,  kv_slice_left:kv_slice_right].contiguous()
+            # Pass the main tensor slices for the next round
+            comm.all_gather(kv_buffer_copy[0], send_k)
+            comm.all_gather(kv_buffer_copy[1], send_v)
 
-            comm.all_gather(k_buffer_copy, send_k)
-            comm.all_gather(v_buffer_copy, send_v)
         q_i = q[:, :, i * nheads // nheads_k : (i + heads_k_stride) * nheads // nheads_k]
-        k_i = torch.cat(k_buffer, dim=1)
-        v_i = torch.cat(v_buffer, dim=1)
+        # kv_buffer[0] has shape (batch_k, seq_k, world_size, heads_k_stride, head_dim)
+        # We want k_i to be (batch_k, seq_k * world_size, heads_k_stride, head_dim)
+        k_i = rearrange(kv_buffer[0], 'b s w hs dh -> b (w s) hs dh')
+        v_i = rearrange(kv_buffer[1], 'b s w hs dh -> b (w s) hs dh')
+
 
         # params = get_default_args(_flash_attn_varlen_forward).copy()
         params = {
@@ -103,7 +93,7 @@ def llama_flash_attn_forward(
             "v": v_i,
             "dropout_p": dropout_p,
             "softmax_scale": softmax_scale,
-            "causal": causal and step == 0,
+            "causal": causal, # 'step' was not defined in this scope
             "window_size_left": window_size[0],
             "window_size_right": window_size[1],
             "softcap": softcap,
@@ -160,8 +150,6 @@ def llama_flash_attn_backward(
         device=k.device,
     )
     kv_buffer_copy = torch.empty_like(kv_buffer)
-    k_buffer, v_buffer = list(kv_buffer[0].unbind(dim=2)), list(kv_buffer[1].unbind(dim=2))
-    k_buffer_copy, v_buffer_copy = list(kv_buffer_copy[0].unbind(dim=2)), list(kv_buffer_copy[1].unbind(dim=2))
 
     dkv_buffer = torch.empty(
         (2, batch_k, seq_k * world_size, heads_k_stride, head_dim),
@@ -187,8 +175,9 @@ def llama_flash_attn_backward(
     k_0 = k[:, :, :heads_k_stride].contiguous()
     v_0 = v[:, :, :heads_k_stride].contiguous()
 
-    comm.all_gather(k_buffer_copy, k_0)
-    comm.all_gather(v_buffer_copy, v_0)
+    # Pass the main tensor slices to all_gather
+    comm.all_gather(kv_buffer_copy[0], k_0)
+    comm.all_gather(kv_buffer_copy[1], v_0)
 
     for i in range(0, nheads_k, heads_k_stride):
         dkv_buffer.zero_()
@@ -206,6 +195,7 @@ def llama_flash_attn_backward(
             lse_i = softmax_lse[q_slice]
 
         comm.wait()
+        # Swap the main storage tensors
         kv_buffer, kv_buffer_copy = kv_buffer_copy, kv_buffer
         # logging.debug(f"bwd i {i} q_slice {q_slice} kshape {k.shape} dv.shape {dv.shape} q.shape {q.shape}")     
 
@@ -215,11 +205,14 @@ def llama_flash_attn_backward(
             kv_slice_right = kv_slice_left + heads_k_stride
             send_k = k[:, :, kv_slice_left:kv_slice_right].contiguous()
             send_v = v[:, :, kv_slice_left:kv_slice_right].contiguous()
-            comm.all_gather(k_buffer_copy, send_k)
-            comm.all_gather(v_buffer_copy, send_v)
+            # Pass the main tensor slices for the next round
+            comm.all_gather(kv_buffer_copy[0], send_k)
+            comm.all_gather(kv_buffer_copy[1], send_v)
 
-        k_i = torch.cat(k_buffer, dim=1)  #[local_k_slice]
-        v_i = torch.cat(v_buffer, dim=1)  #[local_k_slice]
+        # kv_buffer[0] has shape (batch_k, seq_k, world_size, heads_k_stride, head_dim)
+        # We want k_i to be (batch_k, seq_k * world_size, heads_k_stride, head_dim)
+        k_i = rearrange(kv_buffer[0], 'b s w hs dh -> b (w s) hs dh')
+        v_i = rearrange(kv_buffer[1], 'b s w hs dh -> b (w s) hs dh')
         dk_i = dkv_buffer[0]
         dv_i = dkv_buffer[1]
 
