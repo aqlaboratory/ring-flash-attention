@@ -3,6 +3,7 @@ import torch.distributed as dist
 from flash_attn.flash_attn_interface import _flash_attn_forward, _flash_attn_backward
 from .ring_flash_attn import ring_flash_attn_backward
 from einops import rearrange
+from .utils import get_default_args, AllGatherComm as Comm
 import logging
 import torch.distributed._tensor as distp_tensor
 import flash_attn
@@ -13,19 +14,10 @@ if torch.__version__ >= "2.4.0" and flash_attn.__version__ >= "2.7.0":
 else:
     _wrapped_flash_attn_forward = _flash_attn_forward
 
-class AsyncHandles:
-
-    def __init__(self) -> None:
-        self.handles = []
-
-    def register(self, handle):
-        self.handles.append(handle)
-
-    def wait(self):
-        for handle in self.handles:
-            handle.wait()
-        self.handles = []
-
+if torch.__version__ >= "2.4.0":
+    _wrapped_flash_attn_backward = torch.ops.flash_attn._flash_attn_backward
+else:
+    _wrapped_flash_attn_backward = _flash_attn_backward
 
 def llama_flash_attn_forward(
     process_group,
@@ -79,24 +71,15 @@ def llama_flash_attn_forward(
     
     k_0 = k[:, :, :heads_k_stride].contiguous()
     v_0 = v[:, :, :heads_k_stride].contiguous()
-    async_handles = AsyncHandles()
 
-    async_handles.register(
-        dist.all_gather(
-            k_buffer_copy, k_0, group=process_group, async_op=True
-        )
-    )
-    async_handles.register(
-        dist.all_gather(
-            v_buffer_copy, v_0, group=process_group, async_op=True
-        )
-    )
-
+    comm = Comm(process_group)
+    comm.all_gather(k_buffer_copy, k_0)
+    comm.all_gather(v_buffer_copy, v_0)
     for i in range(0, nheads_k, heads_k_stride):
         # Optimization: No sync on last head stride
         if (i == nheads_k - heads_k_stride) and (time_event is not None):
             time_event.record()
-        async_handles.wait()
+        comm.wait()
         k_buffer, k_buffer_copy = k_buffer_copy, k_buffer
         v_buffer, v_buffer_copy = v_buffer_copy, v_buffer
 
@@ -106,17 +89,9 @@ def llama_flash_attn_forward(
             kv_slice_right = kv_slice_left + heads_k_stride
             send_k = k[:,:,  kv_slice_left:kv_slice_right].contiguous()
             send_v = v[:,:,  kv_slice_left:kv_slice_right].contiguous()
-            async_handles.register(
-                dist.all_gather(
-                    k_buffer_copy, send_k, group=process_group, async_op=True
-                )
-            )
-            async_handles.register(
-                dist.all_gather(
-                    v_buffer_copy, send_v, group=process_group, async_op=True
-                )
-            )
 
+            comm.all_gather(k_buffer_copy, send_k)
+            comm.all_gather(v_buffer_copy, send_v)
         q_i = q[:, :, i * nheads // nheads_k : (i + heads_k_stride) * nheads // nheads_k]
         k_i = torch.cat(k_buffer, dim=1)
         v_i = torch.cat(v_buffer, dim=1)
@@ -140,7 +115,12 @@ def llama_flash_attn_forward(
         # if not os.path.exists('./logging/k_buffer_{}.pt'.format(process_id)):
         #     torch.save(k_i.detach(), './logging/k_buffer_{}.pt'.format(process_id))
         # out, _, _, _, _, lse, _, _ = _flash_attn_varlen_forward(**params)
-        out, lse, _, _ = _wrapped_flash_attn_forward(**params)
+        outputs = _wrapped_flash_attn_forward(**params)
+        if len(outputs) == 8:
+            out, _, _, _, _, lse, _, _ = outputs
+        else:
+            assert len(outputs) == 4
+            out, lse, _, _ = outputs
         out_list.append(out)
         lse_list.append(lse)
 
@@ -202,21 +182,13 @@ def llama_flash_attn_backward(
     dk = torch.empty_like(k)
     dv = torch.empty_like(v)
 
-    async_handles = AsyncHandles()
+    comm = Comm(process_group)
 
     k_0 = k[:, :, :heads_k_stride].contiguous()
     v_0 = v[:, :, :heads_k_stride].contiguous()
 
-    async_handles.register(
-        dist.all_gather(
-            k_buffer_copy, k_0, group=process_group, async_op=True
-        )
-    )
-    async_handles.register(
-        dist.all_gather(
-            v_buffer_copy, v_0, group=process_group, async_op=True
-        )
-    )
+    comm.all_gather(k_buffer_copy, k_0)
+    comm.all_gather(v_buffer_copy, v_0)
 
     for i in range(0, nheads_k, heads_k_stride):
         dkv_buffer.zero_()
@@ -233,7 +205,7 @@ def llama_flash_attn_backward(
         else:
             lse_i = softmax_lse[q_slice]
 
-        async_handles.wait()
+        comm.wait()
         kv_buffer, kv_buffer_copy = kv_buffer_copy, kv_buffer
         # logging.debug(f"bwd i {i} q_slice {q_slice} kshape {k.shape} dv.shape {dv.shape} q.shape {q.shape}")     
 
@@ -243,16 +215,8 @@ def llama_flash_attn_backward(
             kv_slice_right = kv_slice_left + heads_k_stride
             send_k = k[:, :, kv_slice_left:kv_slice_right].contiguous()
             send_v = v[:, :, kv_slice_left:kv_slice_right].contiguous()
-            async_handles.register(
-                dist.all_gather(
-                    k_buffer_copy, send_k, group=process_group, async_op=True
-                )
-            )
-            async_handles.register(
-                dist.all_gather(
-                    v_buffer_copy, send_v, group=process_group, async_op=True
-                )
-            )
+            comm.all_gather(k_buffer_copy, send_k)
+            comm.all_gather(v_buffer_copy, send_v)
 
         k_i = torch.cat(k_buffer, dim=1)  #[local_k_slice]
         v_i = torch.cat(v_buffer, dim=1)  #[local_k_slice]
@@ -280,7 +244,7 @@ def llama_flash_attn_backward(
                 "deterministic": deterministic,
         }
         # logging.debug(f"i {i} q {params['q'].shape} k {params['k'].shape} v {params['v'].shape} dout {params['dout'].shape} softmax_lse {params['softmax_lse'].shape}")     
-        _flash_attn_backward(**params)
+        _wrapped_flash_attn_backward(**params)
 
         if heads_k_stride != nheads_k:
             # reduce_scatter needs contiguous buffer

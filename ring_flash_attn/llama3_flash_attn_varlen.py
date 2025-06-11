@@ -349,7 +349,7 @@ class Llama3FlashAttnVarlenFunc(torch.autograd.Function):
             deterministic=False,
         )
         # this should be out_padded
-        logging.debug(f"q {q.view(-1, 2048, 8, 64)[0,:2,:3,:4]} out {out.view(-1, 2048, 8, 64)[0,:2,:3,:4]} softmax_lse {softmax_lse.view(8, -1, 2048)[0,:2,:4]}")     
+        # logging.debug(f"q {q.view(-1, 2048, 8, 64)[0,:2,:3,:4]} out {out.view(-1, 2048, 8, 64)[0,:2,:3,:4]} softmax_lse {softmax_lse.view(8, -1, 2048)[0,:2,:4]}")     
         ctx.save_for_backward(q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k)
         ctx.max_seqlen_q = max_seqlen_q
         ctx.max_seqlen_k = max_seqlen_k
