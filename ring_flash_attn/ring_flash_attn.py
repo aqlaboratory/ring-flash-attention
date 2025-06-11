@@ -5,6 +5,15 @@ from .utils import RingComm, update_out_and_lse, get_default_args
 import logging
 import gc
 
+if torch.__version__ >= "2.4.0" and flash_attn.__version__ >= "2.7.0":
+    _wrapped_flash_attn_forward = torch.ops.flash_attn._flash_attn_forward
+else:
+    _wrapped_flash_attn_forward = _flash_attn_forward
+
+if torch.__version__ >= "2.4.0":
+    _wrapped_flash_attn_backward = torch.ops.flash_attn._flash_attn_backward
+else:
+    _wrapped_flash_attn_backward = _flash_attn_backward
 
 def ring_flash_attn_forward(
     process_group,
@@ -31,7 +40,7 @@ def ring_flash_attn_forward(
             next_k, next_v = comm.send_recv_kv(k, v)
 
         if not causal or step <= comm.rank:
-            params = get_default_args(_flash_attn_forward).copy()
+            params = get_default_args(_wrapped_flash_attn_forward).copy()
             params.update(
                 {
                     "q": q,
@@ -54,7 +63,7 @@ def ring_flash_attn_forward(
                         "window_size_right": window_size[1],
                     }
                 )
-            outputs = _flash_attn_forward(**params)
+            outputs = _wrapped_flash_attn_forward(**params)
             if len(outputs) == 8:
                 block_out, _, _, _, _, block_lse, _, _ = outputs
             else:
@@ -108,7 +117,7 @@ def ring_flash_attn_backward(
 
         if step <= kv_comm.rank or not causal:
             bwd_causal = causal and step == 0
-            params = get_default_args(_flash_attn_backward).copy()
+            params = get_default_args(_wrapped_flash_attn_backward).copy()
             params.update(
                 {
                     "dout": dout,
@@ -138,7 +147,7 @@ def ring_flash_attn_backward(
                     }
                 )
             # logging.debug(f"q {params['q'].shape} k {params['k'].shape} v {params['v'].shape} dout {params['dout'].shape} softmax_lse {params['softmax_lse'].shape}")            
-            _flash_attn_backward(**params)
+            _wrapped_flash_attn_backward(**params)
 
             if dq is None:
                 dq = block_dq_buffer.to(torch.float32)
