@@ -4,6 +4,7 @@ from flash_attn.flash_attn_interface import _flash_attn_forward, _flash_attn_bac
 from .utils import RingComm, update_out_and_lse, get_default_args
 import logging
 import gc
+import flash_attn
 
 if torch.__version__ >= "2.4.0" and flash_attn.__version__ >= "2.7.0":
     _wrapped_flash_attn_forward = torch.ops.flash_attn._flash_attn_forward
