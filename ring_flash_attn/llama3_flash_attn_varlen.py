@@ -4,29 +4,30 @@ from flash_attn.flash_attn_interface import (
     _flash_attn_varlen_forward,
     _flash_attn_varlen_backward,
 )
-from .utils import get_default_args
 import logging
-
-class AsyncHandles:
-
-    def __init__(self) -> None:
-        self.handles = []
-
-    def register(self, handle):
-        self.handles.append(handle)
-
-    def wait(self):
-        for handle in self.handles:
-            handle.wait()
-        self.handles = []
+from .utils import get_default_args, AllGatherComm as Comm
 
 
-def llama3_flash_attn_prepare_cu_seqlens(cu_seqlens, causal, rank, world_size):
-    total_length = cu_seqlens[-1].item()
+def llama3_flash_attn_prepare_cu_seqlens(
+    cu_seqlens: torch.Tensor, causal: bool, rank: int, world_size: int
+):
+    """
+    Args:
+        cu_seqlens: torch.Tensor, the cu_seqlens of all the sequences across the ring process group.
+
+    Returns:
+        cu_seqlens_q: torch.Tensor, the cu_seqlens of the q slice for this rank.
+        cu_seqlens_k: torch.Tensor, the cu_seqlens of the k slice that the local q need. Note
+            that this may be longer than `total_seq_len // world_size`.
+        local_k_slice: slice, the slice of the k that the local q need. Note
+            that this may be longer than `total_seq_len // world_size`.
+    """
+    total_length = cu_seqlens[-1]
     assert total_length % world_size == 0
     length_per_rank = total_length // world_size
     left = torch.searchsorted(cu_seqlens, rank * length_per_rank)
     right = torch.searchsorted(cu_seqlens, (rank + 1) * length_per_rank)
+    length_per_rank = length_per_rank.item()
 
     # after this, cu_seqlens[left:right + 1] contains all the sequence for this rank
     if cu_seqlens[left] != rank * length_per_rank:
@@ -97,21 +98,13 @@ def llama3_flash_attn_varlen_forward(
 
     k_0 = k[:, :heads_k_stride].contiguous()
     v_0 = v[:, :heads_k_stride].contiguous()
-    async_handles = AsyncHandles()
+    comm = Comm(process_group)
 
-    async_handles.register(
-        dist.all_gather_into_tensor(
-            kv_buffer_copy[0], k_0, group=process_group, async_op=True
-        )
-    )
-    async_handles.register(
-        dist.all_gather_into_tensor(
-            kv_buffer_copy[1], v_0, group=process_group, async_op=True
-        )
-    )
+    comm.all_gather(kv_buffer_copy[0], k_0)
+    comm.all_gather(kv_buffer_copy[1], v_0)
 
     for i in range(0, nheads_k, heads_k_stride):
-        async_handles.wait()
+        comm.wait()
         kv_buffer, kv_buffer_copy = kv_buffer_copy, kv_buffer
 
         if i < nheads_k - heads_k_stride:
@@ -120,21 +113,13 @@ def llama3_flash_attn_varlen_forward(
             kv_slice_right = kv_slice_left + heads_k_stride
             send_k = k[:, kv_slice_left:kv_slice_right].contiguous()
             send_v = v[:, kv_slice_left:kv_slice_right].contiguous()
-            async_handles.register(
-                dist.all_gather_into_tensor(
-                    kv_buffer_copy[0], send_k, group=process_group, async_op=True
-                )
-            )
-            async_handles.register(
-                dist.all_gather_into_tensor(
-                    kv_buffer_copy[1], send_v, group=process_group, async_op=True
-                )
-            )
+            comm.all_gather(kv_buffer_copy[0], send_k)
+            comm.all_gather(kv_buffer_copy[1], send_v)
 
         q_i = q[:, i * nheads // nheads_k : (i + heads_k_stride) * nheads // nheads_k]
         k_i = kv_buffer[0][local_k_slice]
         v_i = kv_buffer[1][local_k_slice]
-        logging.debug(f"fwd i {i} k_ishape {k_i.shape} q.shape {q.shape} kv_buffer[0] {kv_buffer[0].shape} local_k_slice {local_k_slice}")     
+        # logging.debug(f"fwd i {i} k_ishape {k_i.shape} q.shape {q.shape} kv_buffer[0] {kv_buffer[0].shape} local_k_slice {local_k_slice}")     
 
         # params = get_default_args(_flash_attn_varlen_forward).copy()
         params = {
@@ -148,16 +133,25 @@ def llama3_flash_attn_varlen_forward(
                 "dropout_p": dropout_p,
                 "softmax_scale": softmax_scale,
                 "causal": causal,
-                "window_size_left": window_size[0],
-                "window_size_right": window_size[1],
                 "softcap": softcap,
                 "alibi_slopes": alibi_slopes,
                 "return_softmax": True and dropout_p > 0,
         }
-        # out, _, _, _, _, lse, _, _ = _flash_attn_varlen_forward(**params)
-        out, lse, _, _ = _flash_attn_varlen_forward(
-            **params
-        )
+        if "window_size" in params:
+            params.update({"window_size": window_size})
+        else:
+            params.update(
+                {
+                    "window_size_left": window_size[0],
+                    "window_size_right": window_size[1],
+                }
+            )
+        outputs = _flash_attn_varlen_forward(**params)
+        if len(outputs) == 8:
+            out, _, _, _, _, lse, _, _ = outputs
+        else:
+            assert len(outputs) == 4
+            out, lse, _, _ = outputs
         out_list.append(out)
         lse_list.append(lse)
 
@@ -217,20 +211,12 @@ def llama3_flash_attn_varlen_backward(
     dk = torch.empty_like(k)
     dv = torch.empty_like(v)
 
-    async_handles = AsyncHandles()
+    comm = Comm(process_group)
 
     k_0 = k[:, :heads_k_stride].contiguous()
     v_0 = v[:, :heads_k_stride].contiguous()
-    async_handles.register(
-        dist.all_gather_into_tensor(
-            kv_buffer_copy[0], k_0, group=process_group, async_op=True
-        )
-    )
-    async_handles.register(
-        dist.all_gather_into_tensor(
-            kv_buffer_copy[1], v_0, group=process_group, async_op=True
-        )
-    )
+    comm.all_gather(kv_buffer_copy[0], k_0)
+    comm.all_gather(kv_buffer_copy[1], v_0)
 
     for i in range(0, nheads_k, heads_k_stride):
         dkv_buffer.zero_()
@@ -247,7 +233,7 @@ def llama3_flash_attn_varlen_backward(
         else:
             lse_i = softmax_lse[q_slice]
 
-        async_handles.wait()
+        comm.wait()
         kv_buffer, kv_buffer_copy = kv_buffer_copy, kv_buffer
 
         if i < nheads_k - heads_k_stride:
@@ -256,21 +242,14 @@ def llama3_flash_attn_varlen_backward(
             kv_slice_right = kv_slice_left + heads_k_stride
             send_k = k[:, kv_slice_left:kv_slice_right].contiguous()
             send_v = v[:, kv_slice_left:kv_slice_right].contiguous()
-            async_handles.register(
-                dist.all_gather_into_tensor(
-                    kv_buffer_copy[0], send_k, group=process_group, async_op=True
-                )
-            )
-            async_handles.register(
-                dist.all_gather_into_tensor(
-                    kv_buffer_copy[1], send_v, group=process_group, async_op=True
-                )
-            )
+            comm.all_gather(kv_buffer_copy[0], send_k)
+            comm.all_gather(kv_buffer_copy[1], send_v)
+
         k_i = kv_buffer[0][local_k_slice]
         v_i = kv_buffer[1][local_k_slice]
         dk_i = dkv_buffer[0][local_k_slice]
         dv_i = dkv_buffer[1][local_k_slice]
-        logging.debug(f"bwd i {i} q_slice {q_slice} k_ishape {k_i.shape} dv_i.shape {dv_i.shape} q.shape {q.shape}")  
+        # logging.debug(f"bwd i {i} q_slice {q_slice} k_ishape {k_i.shape} dv_i.shape {dv_i.shape} q.shape {q.shape}")  
 
         # params = get_default_args(_flash_attn_varlen_backward).copy()
         params = {
@@ -290,12 +269,19 @@ def llama3_flash_attn_varlen_backward(
                 "dropout_p": dropout_p,
                 "softmax_scale": softmax_scale,
                 "causal": causal,
-                "window_size_left": window_size[0],
-                "window_size_right": window_size[1],
                 "softcap": softcap,
                 "alibi_slopes": alibi_slopes,
                 "deterministic": deterministic,
-        }
+            }
+        if "window_size" in params:
+            params.update({"window_size": window_size})
+        else:
+            params.update(
+                {
+                    "window_size_left": window_size[0],
+                    "window_size_right": window_size[1],
+                }
+            )
         _flash_attn_varlen_backward(**params)
 
         if heads_k_stride != nheads_k:

@@ -28,7 +28,7 @@ def get_half_index(cu_seqlens, *, front: bool):
         else:
             return slice(cu_seqlens[-1] // 2, None)
 
-    index = torch.zeros((cu_seqlens[-1],), dtype=bool)
+    index = torch.zeros((cu_seqlens[-1].item(),), dtype=torch.bool)
     for i in range(len(cu_seqlens) - 1):
         start, end = cu_seqlens[i], cu_seqlens[i + 1]
         if front:
@@ -121,20 +121,31 @@ def zigzag_ring_flash_attn_varlen_forward(
                 "dropout_p": dropout_p,
                 "softmax_scale": softmax_scale,
                 "causal": causal,
-                "window_size": window_size,
                 "alibi_slopes": alibi_slopes,
                 "return_softmax": True and dropout_p > 0,
             }
         )
-        block_out, _, _, _, _, block_lse, _, _ = _flash_attn_varlen_forward(**params)
+        if "window_size" in params:
+            params.update({"window_size": window_size})
+        else:
+            params.update(
+                {
+                    "window_size_left": window_size[0],
+                    "window_size_right": window_size[1],
+                }
+            )
+        outputs = _flash_attn_varlen_forward(**params)
+        if len(outputs) == 8:
+            block_out, _, _, _, _, block_lse, _, _ = outputs
+        else:
+            assert len(outputs) == 4
+            block_out, block_lse, _, _ = outputs
         return block_out, block_lse
 
     old_lse = False
     for step in range(comm.world_size):
         if step + 1 != comm.world_size:
-            next_k: torch.Tensor = comm.send_recv(k)
-            next_v: torch.Tensor = comm.send_recv(v)
-            comm.commit()
+            next_k, next_v = comm.send_recv_kv(k, v)
 
         if step == 0:
             block_out, block_lse = forward(q, k, v, causal=True)
@@ -170,8 +181,7 @@ def zigzag_ring_flash_attn_varlen_forward(
 
         if step + 1 != comm.world_size:
             comm.wait()
-            k = next_k
-            v = next_v
+            k, v = next_k, next_v
 
     out = out.to(q.dtype)
     if old_lse:
@@ -249,18 +259,24 @@ def zigzag_ring_flash_attn_varlen_backward(
                 "dropout_p": dropout_p,
                 "softmax_scale": softmax_scale,
                 "causal": causal,
-                "window_size": window_size,
                 "alibi_slopes": alibi_slopes,
                 "deterministic": deterministic,
             }
         )
+        if "window_size" in params:
+            params.update({"window_size": window_size})
+        else:
+            params.update(
+                {
+                    "window_size_left": window_size[0],
+                    "window_size_right": window_size[1],
+                }
+            )
         _flash_attn_varlen_backward(**params)
 
     for step in range(kv_comm.world_size):
         if step + 1 != kv_comm.world_size:
-            next_k = kv_comm.send_recv(k)
-            next_v = kv_comm.send_recv(v)
-            kv_comm.commit()
+            next_k, next_v = kv_comm.send_recv_kv(k, v)
 
         if step == 0:
             backward(dout, q, k, v, out, softmax_lse, causal=True)
@@ -290,12 +306,11 @@ def zigzag_ring_flash_attn_varlen_backward(
 
         if step + 1 != kv_comm.world_size:
             kv_comm.wait()
-            k = next_k
-            v = next_v
+            k, v = next_k, next_v
 
-        next_dk = d_kv_comm.send_recv(dk, dk_comm_buffer)
-        next_dv = d_kv_comm.send_recv(dv, dv_comm_buffer)
-        d_kv_comm.commit()
+        next_dk, next_dv = d_kv_comm.send_recv_kv(
+            dk, dv, dk_comm_buffer, dv_comm_buffer
+        )
 
     d_kv_comm.wait()
 

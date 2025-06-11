@@ -28,33 +28,43 @@ def ring_flash_attn_forward(
 
     for step in range(comm.world_size):
         if step + 1 != comm.world_size:
-            next_k: torch.Tensor = comm.send_recv(k)
-            next_v: torch.Tensor = comm.send_recv(v)
-            comm.commit()
+            next_k, next_v = comm.send_recv_kv(k, v)
 
         if not causal or step <= comm.rank:
-            # params = get_default_args(_flash_attn_forward).copy()
-            params = {
-                "q": q,
-                "k": k,
-                "v": v,
-                "dropout_p": dropout_p,
-                "softmax_scale": softmax_scale,
-                "causal": causal and step == 0,
-                "window_size_left": window_size[0],
-                "window_size_right": window_size[1],
-                "softcap": softcap,
-                "alibi_slopes": alibi_slopes,
-                "return_softmax": True and dropout_p > 0,
-            }
-            # block_out, _, _, _, _, block_lse, _, _ = _flash_attn_forward(**params)
-            block_out, block_lse, _, _ = _flash_attn_forward(**params)
+            params = get_default_args(_flash_attn_forward).copy()
+            params.update(
+                {
+                    "q": q,
+                    "k": k,
+                    "v": v,
+                    "dropout_p": dropout_p,
+                    "softmax_scale": softmax_scale,
+                    "causal": causal and step == 0,
+                    "softcap": softcap,
+                    "alibi_slopes": alibi_slopes,
+                    "return_softmax": True and dropout_p > 0,
+                }
+            )
+            if "window_size" in params:
+                params.update({"window_size": window_size})
+            else:
+                params.update(
+                    {
+                        "window_size_left": window_size[0],
+                        "window_size_right": window_size[1],
+                    }
+                )
+            outputs = _flash_attn_forward(**params)
+            if len(outputs) == 8:
+                block_out, _, _, _, _, block_lse, _, _ = outputs
+            else:
+                assert len(outputs) == 4
+                block_out, block_lse, _, _ = outputs
             out, lse = update_out_and_lse(out, lse, block_out, block_lse)
 
         if step + 1 != comm.world_size:
             comm.wait()
-            k = next_k
-            v = next_v
+            k, v = next_k, next_v
 
     out = out.to(q.dtype)
     lse = lse.squeeze(dim=-1).transpose(1, 2)
@@ -92,33 +102,41 @@ def ring_flash_attn_backward(
 
     for step in range(kv_comm.world_size):
         if step + 1 != kv_comm.world_size:
-            next_k = kv_comm.send_recv(k)
-            next_v = kv_comm.send_recv(v)
-            kv_comm.commit()
+            next_k, next_v = kv_comm.send_recv_kv(k, v)
         elif time_event is not None:
             time_event.record()
+
         if step <= kv_comm.rank or not causal:
             bwd_causal = causal and step == 0
-            # params = get_default_args(_flash_attn_backward).copy()
-            params = {
-                "dout": dout,
-                "q": q,
-                "k": k,
-                "v": v,
-                "out": out,
-                "softmax_lse": softmax_lse,
-                "dq": block_dq_buffer,
-                "dk": block_dk_buffer,
-                "dv": block_dv_buffer,
-                "dropout_p": dropout_p,
-                "softmax_scale": softmax_scale,
-                "causal": bwd_causal,
-                "window_size_left": window_size[0],
-                "window_size_right": window_size[1],
-                "softcap": softcap,
-                "alibi_slopes": alibi_slopes,
-                "deterministic": deterministic,
-            }
+            params = get_default_args(_flash_attn_backward).copy()
+            params.update(
+                {
+                    "dout": dout,
+                    "q": q,
+                    "k": k,
+                    "v": v,
+                    "out": out,
+                    "softmax_lse": softmax_lse,
+                    "dq": block_dq_buffer,
+                    "dk": block_dk_buffer,
+                    "dv": block_dv_buffer,
+                    "dropout_p": dropout_p,
+                    "softmax_scale": softmax_scale,
+                    "causal": bwd_causal,
+                    "softcap": softcap,
+                    "alibi_slopes": alibi_slopes,
+                    "deterministic": deterministic,
+                }
+            )
+            if "window_size" in params:
+                params.update({"window_size": window_size})
+            else:
+                params.update(
+                    {
+                        "window_size_left": window_size[0],
+                        "window_size_right": window_size[1],
+                    }
+                )
             # logging.debug(f"q {params['q'].shape} k {params['k'].shape} v {params['v'].shape} dout {params['dout'].shape} softmax_lse {params['softmax_lse'].shape}")            
             _flash_attn_backward(**params)
 
@@ -133,17 +151,13 @@ def ring_flash_attn_backward(
                 dv = block_dv_buffer + next_dv
         elif step != 0:
             d_kv_comm.wait()
-            dk = next_dk
-            dv = next_dv
+            dk, dv = next_dk, next_dv
 
         if step + 1 != kv_comm.world_size:
             kv_comm.wait()
-            k = next_k
-            v = next_v
+            k, v = next_k, next_v
 
-        next_dk = d_kv_comm.send_recv(dk)
-        next_dv = d_kv_comm.send_recv(dv)
-        d_kv_comm.commit()
+        next_dk, next_dv = d_kv_comm.send_recv_kv(dk, dv)
 
     d_kv_comm.wait()
 
