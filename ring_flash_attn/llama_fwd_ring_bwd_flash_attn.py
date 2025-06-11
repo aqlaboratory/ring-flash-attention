@@ -47,7 +47,7 @@ def llama_flash_attn_forward(
     world_size = dist.get_world_size(process_group)
 
     kv_buffer = torch.empty(
-        (2, batch_k, seq_k, world_size, heads_k_stride, head_dim),
+        (2, world_size, batch_k, seq_k, heads_k_stride, head_dim),
         dtype=k.dtype,
         device=k.device,
     )
@@ -82,8 +82,8 @@ def llama_flash_attn_forward(
         q_i = q[:, :, i * nheads // nheads_k : (i + heads_k_stride) * nheads // nheads_k]
         # kv_buffer[0] has shape (batch_k, seq_k, world_size, heads_k_stride, head_dim)
         # We want k_i to be (batch_k, seq_k * world_size, heads_k_stride, head_dim)
-        k_i = rearrange(kv_buffer[0], 'b s w hs dh -> b (w s) hs dh')
-        v_i = rearrange(kv_buffer[1], 'b s w hs dh -> b (w s) hs dh')
+        k_i = rearrange(kv_buffer[0], 'w b s hs dh -> b (w s) hs dh')
+        v_i = rearrange(kv_buffer[1], 'w b s hs dh -> b (w s) hs dh')
 
 
         # params = get_default_args(_flash_attn_varlen_forward).copy()
@@ -145,7 +145,7 @@ def llama_flash_attn_backward(
     world_size = dist.get_world_size(process_group)
     
     kv_buffer = torch.empty(
-        (2, batch_k, seq_k, world_size, heads_k_stride, head_dim),
+        (2, world_size, batch_k, seq_k, heads_k_stride, head_dim),
         dtype=k.dtype,
         device=k.device,
     )
@@ -211,8 +211,8 @@ def llama_flash_attn_backward(
 
         # kv_buffer[0] has shape (batch_k, seq_k, world_size, heads_k_stride, head_dim)
         # We want k_i to be (batch_k, seq_k * world_size, heads_k_stride, head_dim)
-        k_i = rearrange(kv_buffer[0], 'b s w hs dh -> b (w s) hs dh')
-        v_i = rearrange(kv_buffer[1], 'b s w hs dh -> b (w s) hs dh')
+        k_i = rearrange(kv_buffer[0], 'w b s hs dh -> b (w s) hs dh')
+        v_i = rearrange(kv_buffer[1], 'w b s hs dh -> b (w s) hs dh')
         dk_i = dkv_buffer[0]
         dv_i = dkv_buffer[1]
 
