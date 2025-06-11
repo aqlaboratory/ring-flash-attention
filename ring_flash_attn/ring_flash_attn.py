@@ -41,7 +41,7 @@ def ring_flash_attn_forward(
             next_k, next_v = comm.send_recv_kv(k, v)
 
         if not causal or step <= comm.rank:
-            params = get_default_args(_wrapped_flash_attn_forward).copy()
+            params = get_default_args(_flash_attn_forward).copy()
             params.update(
                 {
                     "q": q,
@@ -118,7 +118,7 @@ def ring_flash_attn_backward(
 
         if step <= kv_comm.rank or not causal:
             bwd_causal = causal and step == 0
-            params = get_default_args(_wrapped_flash_attn_backward).copy()
+            params = get_default_args(_flash_attn_backward).copy()
             params.update(
                 {
                     "dout": dout,
