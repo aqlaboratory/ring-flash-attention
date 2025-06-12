@@ -17,13 +17,12 @@ class LlamaStandardAttn(torch.nn.Module):
         self,
         heads_k_stride: int=2,
         attn_q_chunk_size: int=128,
-        bwd_event_sync: bool=False, # Not relevant for standard autograd
+        # bwd_event_sync: bool=False, # Not relevant for standard autograd
     ):
         super().__init__()
         self.sp_mesh = None
         self.heads_k_stride = heads_k_stride
         self.attn_q_chunk_size = attn_q_chunk_size
-        self.bwd_event_sync = bwd_event_sync
 
     def forward(
         self,
@@ -64,9 +63,7 @@ class LlamaStandardAttn(torch.nn.Module):
         _, _, num_kv_heads, _ = k.shape
         assert num_q_heads == num_kv_heads
         assert num_q_heads % self.heads_k_stride == 0
-        time_event = None
-        if self.bwd_event_sync:
-            time_event = torch.cuda.Event(enable_timing=False)
+
 
         gathered_key_padding_mask = key_padding_mask
         
@@ -83,7 +80,6 @@ class LlamaStandardAttn(torch.nn.Module):
             process_group = self.sp_mesh.get_group()
             comm = Comm(process_group)
             world_size = dist.get_world_size(process_group)
-            rank = dist.get_rank(process_group)
 
             if key_padding_mask is not None:
                 mask_list = [torch.empty_like(key_padding_mask) for _ in range(world_size)]
@@ -106,9 +102,7 @@ class LlamaStandardAttn(torch.nn.Module):
             comm.all_gather(kv_buffer_copy[1], v_0)
 
             for i in range(0, num_kv_heads, self.heads_k_stride):
-                # Optimization: No sync on last head stride
-                if (i == num_kv_heads - self.heads_k_stride) and (time_event is not None):
-                    time_event.record()
+
                 comm.wait()
                 # Swap the main storage tensors
                 kv_buffer, kv_buffer_copy = kv_buffer_copy, kv_buffer
@@ -141,8 +135,6 @@ class LlamaStandardAttn(torch.nn.Module):
                     probs_list.append(probs)
         # output concat heads [B H S D]; S is the local sequence length
         output = rearrange(output_list,'hstride b h s d -> b s (hstride h) d')
-        if time_event is not None:
-            time_event.synchronize()
 
         if return_attn_probs:
             # probs concat heads [B H Sq Sk]; Sq is local sequence length of q
@@ -195,8 +187,9 @@ class LlamaStandardAttn(torch.nn.Module):
             attn_score = q[:, :, q_start:q_chunk_end] @ k.transpose(-2, -1)
             if key_padding_mask is not None:
                 mask_to_apply = key_padding_mask.view(batch_size, 1, 1, global_seq_len_kv)
-                attn_score = attn_score.masked_fill(mask_to_apply == False, float('-inf'))
-            attn_probs = torch.softmax(attn_score, dim=-1)
+                attn_score = attn_score.float().masked_fill(
+                    mask_to_apply == False, float('-inf'))
+            attn_probs = torch.softmax(attn_score, dim=-1).type_as(q)
             if dropout_p > 0.0:
                 # TODO: Check if this is correct dropout application
                 attn_probs = nn.functional.dropout(attn_probs, p=dropout_p, training=self.training)                
