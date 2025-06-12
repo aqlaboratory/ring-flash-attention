@@ -179,7 +179,7 @@ class LlamaStandardAttn(torch.nn.Module):
         if self.attn_q_chunk_size is None:
             attn_q_chunk_size = local_seq_len_q
         if local_seq_len_q % attn_q_chunk_size:
-            query_chunk_size += 1
+            attn_q_chunk_size += 1
 
         all_attn_output = torch.empty(
             (batch_size, num_q_heads, local_seq_len_q, head_dim),
