@@ -185,9 +185,10 @@ class LlamaStandardAttn(torch.nn.Module):
         for q_start in range(0, local_seq_len_q, attn_q_chunk_size):
             q_chunk_end = min(q_start + attn_q_chunk_size, local_seq_len_q)
             attn_score = q[:, :, q_start:q_chunk_end] @ k.transpose(-2, -1)
+            attn_score = attn_score.float()
             if key_padding_mask is not None:
                 mask_to_apply = key_padding_mask.view(batch_size, 1, 1, global_seq_len_kv)
-                attn_score = attn_score.float().masked_fill(
+                attn_score = attn_score.masked_fill(
                     mask_to_apply == False, float('-inf'))
             attn_probs = torch.softmax(attn_score, dim=-1).type_as(q)
             if dropout_p > 0.0:
