@@ -136,8 +136,6 @@ class LlamaStandardAttn(torch.nn.Module):
                     dropout_p=dropout_p,
                     key_padding_mask=gathered_key_padding_mask,
                 )
-                if i == num_kv_heads - self.heads_k_stride and time_event is not None:
-                    time_event.record()
                 output_list.append(output)
                 if return_attn_probs:
                     probs_list.append(probs)
