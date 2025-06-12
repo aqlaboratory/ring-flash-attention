@@ -16,13 +16,13 @@ class LlamaStandardAttn(torch.nn.Module):
     def __init__(
         self,
         heads_k_stride: int=2,
-        attn_query_chunks: int=128,
+        attn_q_chunk_size: int=128,
         bwd_event_sync: bool=False, # Not relevant for standard autograd
     ):
         super().__init__()
         self.sp_mesh = None
         self.heads_k_stride = heads_k_stride
-        self.attn_query_chunks = attn_query_chunks
+        self.attn_q_chunk_size = attn_q_chunk_size
         self.bwd_event_sync = bwd_event_sync
 
     def forward(
@@ -175,11 +175,10 @@ class LlamaStandardAttn(torch.nn.Module):
         """
         batch_size, num_q_heads, local_seq_len_q, head_dim = q.shape
         _, _, global_seq_len_kv, _ = k.shape
-        attn_query_chunks = self.attn_query_chunks
-        if self.attn_query_chunks is None:
-            attn_query_chunks = local_seq_len_q
-        query_chunk_size = local_seq_len_q // self.attn_query_chunks
-        if local_seq_len_q % self.attn_query_chunks:
+        attn_q_chunk_size = self.attn_q_chunk_size
+        if self.attn_q_chunk_size is None:
+            attn_q_chunk_size = local_seq_len_q
+        if local_seq_len_q % attn_q_chunk_size:
             query_chunk_size += 1
 
         all_attn_output = torch.empty(
@@ -193,14 +192,14 @@ class LlamaStandardAttn(torch.nn.Module):
             device=q.device,
         )
 
-        for q_start in range(0, local_seq_len_q, query_chunk_size):
-            q_chunk_end = min(q_start + query_chunk_size, local_seq_len_q)
+        for q_start in range(0, local_seq_len_q, attn_q_chunk_size):
+            q_chunk_end = min(q_start + attn_q_chunk_size, local_seq_len_q)
             attn_score = q[:, :, q_start:q_chunk_end] @ k.transpose(-2, -1)
             if key_padding_mask is not None:
                 mask_to_apply = key_padding_mask.view(batch_size, 1, 1, global_seq_len_kv)
                 attn_score = attn_score.masked_fill(mask_to_apply == False, float('-inf'))
             attn_probs = torch.softmax(attn_score, dim=-1)
-            if self.dropout_p > 0.0:
+            if dropout_p > 0.0:
                 # TODO: Check if this is correct dropout application
                 attn_probs = nn.functional.dropout(attn_probs, p=dropout_p, training=self.training)                
             all_attn_probs[:, :, q_start:q_chunk_end] = attn_probs
