@@ -15,28 +15,27 @@ class LlamaStandardAttn(torch.nn.Module):
 
     def __init__(
         self,
-        dropout_p: float = 0.0,
         heads_k_stride: int=2,
         attn_query_chunks: int=128,
-        # bwd_event_sync: bool=False, # Not relevant for standard autograd
+        bwd_event_sync: bool=False, # Not relevant for standard autograd
     ):
         super().__init__()
-        self.dropout_p = dropout_p
         self.sp_mesh = None
         self.heads_k_stride = heads_k_stride
         self.attn_query_chunks = attn_query_chunks
-        # self.bwd_event_sync = bwd_event_sync
+        self.bwd_event_sync = bwd_event_sync
 
     def forward(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
+        dropout_p: float = 0.0,
         key_padding_mask: Optional[torch.Tensor] = None,
         softmax_scale: Optional[float] = None,
         #causal: bool = False,  # TODO: To implement
         return_attn_probs: bool = False,
-        time_event=None,  # Sync GPU,CPU to lower vRAM allocation; no sync by default
+        # time_event=None,  # Sync GPU,CPU to lower vRAM allocation; no sync by default
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         Forward pass for the Llama standard attention module.
@@ -49,6 +48,7 @@ class LlamaStandardAttn(torch.nn.Module):
             q (torch.Tensor): Query tensor.
             k (torch.Tensor): Key tensor.
             v (torch.Tensor): Value tensor.
+            dropout_p (float): Dropout probability.
             key_padding_mask (Optional[torch.Tensor]): Boolean mask for padding in keys.
                 Shape (batch_size, local_seq_len_kv). True for valid tokens, False for padding.
             softmax_scale (Optional[float]): Scale for softmax. Defaults to 1/sqrt(head_dim).
@@ -61,14 +61,16 @@ class LlamaStandardAttn(torch.nn.Module):
                                      Shape (batch_size, num_kv_heads, num_q_groups, local_seq_len_q, global_seq_len_kv).
         """
         batch_size, local_seq_len_q, num_q_heads, head_dim = q.shape
-        _, local_seq_len_kv, num_kv_heads, _ = k.shape
+        _, _, num_kv_heads, _ = k.shape
         assert num_q_heads == num_kv_heads
         assert num_q_heads % self.heads_k_stride == 0
+        time_event = None
+        if self.bwd_event_sync:
+            time_event = torch.cuda.Event(enable_timing=False)
 
         gathered_key_padding_mask = key_padding_mask
         
         world_size = 1
-        rank = 0
         q, k, v = rearrange([q, k, v], 'qkv b s h d -> qkv b h s d')
 
         if softmax_scale is None:
@@ -131,12 +133,18 @@ class LlamaStandardAttn(torch.nn.Module):
                     q_i,
                     k_i,
                     v_i,
+                    dropout_p=dropout_p,
                     key_padding_mask=gathered_key_padding_mask,
                 )
+                if i == num_kv_heads - self.heads_k_stride and time_event is not None:
+                    time_event.record()
                 output_list.append(output)
-                probs_list.append(probs)
+                if return_attn_probs:
+                    probs_list.append(probs)
         # output concat heads [B H S D]; S is the local sequence length
         output = rearrange(output_list,'hstride b h s d -> b s (hstride h) d')
+        if time_event is not None:
+            time_event.synchronize()
 
         if return_attn_probs:
             # probs concat heads [B H Sq Sk]; Sq is local sequence length of q
@@ -150,9 +158,10 @@ class LlamaStandardAttn(torch.nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
+        dropout_p: float = 0.0,
         key_padding_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Self-attention.
+        """Self-attention chunked.
 
         Intput tensor shape [B H S D]
         Args:
@@ -193,7 +202,7 @@ class LlamaStandardAttn(torch.nn.Module):
             attn_probs = torch.softmax(attn_score, dim=-1)
             if self.dropout_p > 0.0:
                 # TODO: Check if this is correct dropout application
-                attn_probs = nn.functional.dropout(attn_probs, p=self.dropout_p, training=self.training)                
+                attn_probs = nn.functional.dropout(attn_probs, p=dropout_p, training=self.training)                
             all_attn_probs[:, :, q_start:q_chunk_end] = attn_probs
             all_attn_output[:, :, q_start:q_chunk_end] = attn_probs @ v
 
