@@ -17,7 +17,7 @@ class LlamaStandardAttn(torch.nn.Module):
         self,
         dropout_p: float = 0.0,
         heads_k_stride: int=2,
-        attn_query_chunks: int=100,
+        attn_query_chunks: int=128,
         # bwd_event_sync: bool=False, # Not relevant for standard autograd
     ):
         super().__init__()
@@ -136,11 +136,11 @@ class LlamaStandardAttn(torch.nn.Module):
                 output_list.append(output)
                 probs_list.append(probs)
         # output concat heads [B H S D]; S is the local sequence length
-        output = rearrange(output_list,'w b h s d -> b (w s) h d')
+        output = rearrange(output_list,'hstride b h s d -> b s (hstride h) d')
 
         if return_attn_probs:
             # probs concat heads [B H Sq Sk]; Sq is local sequence length of q
-            probs = rearrange(probs_list,'w b h s d -> b (w s) h d')
+            probs = rearrange(probs_list,'hstride b h sq sk -> b (hstride h) sq sk')
             return output, probs
         else:
             return output, None
