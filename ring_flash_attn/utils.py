@@ -11,7 +11,7 @@ __all__ = ["update_out_and_lse", "RingComm", "get_default_args"]
 
 
 @cache
-def get_default_args(func):
+def _get_default_args(func):
     spec = inspect.getfullargspec(func)
     defaults = spec.defaults if spec.defaults is not None else ()
     padded_defaults = (None,) * (len(spec.args) - len(defaults)) + defaults
@@ -19,6 +19,14 @@ def get_default_args(func):
     if "softcap" in args:
         args["softcap"] = 0.0
     return args
+
+
+def get_default_args(func):
+    if inspect.isfunction(func):
+        return _get_default_args(func)
+    else:
+        # Use the origin _init_fn in CustomOpDef
+        return _get_default_args(func._init_fn)
 
 
 @torch.jit.script
@@ -130,3 +138,31 @@ class RingComm:
             req.wait()
         self._reqs = None
         self._ops = []
+
+    def send_recv_kv(
+        self,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        k_buffer: Optional[torch.Tensor] = None,
+        v_buffer: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        next_k, next_v = self.send_recv(k, k_buffer), self.send_recv(v, v_buffer)
+        self.commit()
+        return next_k, next_v
+
+
+class AllGatherComm:
+    def __init__(self, group=None) -> None:
+        self.group = group
+        self.handles = []
+
+    def all_gather(self, output_tensor: torch.Tensor, input_tensor: torch.Tensor):
+        handle = dist.all_gather_into_tensor(
+            output_tensor, input_tensor, group=self.group, async_op=True
+        )
+        self.handles.append(handle)
+
+    def wait(self):
+        for handle in self.handles:
+            handle.wait()
+        self.handles = []
