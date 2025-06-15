@@ -16,10 +16,12 @@ class LlamaStandardAttn(torch.autograd.Function):
         heads_k_stride,
         dropout_p,
         softmax_scale,
-        casual,  # TODO: To implement
-        return_attn_probs,
-        process_group,
-        bwd_event_sync,
+        key_padding_mask=None,
+        attn_q_chunk_size=None,
+        causal=False,  # TODO: To implement
+        return_attn_probs=False,
+        process_group=None,
+        bwd_event_sync=False,
     ):
         time_event = torch.cuda.Event(enable_timing=False)
         if softmax_scale is None:
@@ -32,26 +34,27 @@ class LlamaStandardAttn(torch.autograd.Function):
             k,
             v,
             process_group=process_group,
-            key_padding_mask=None,
-            return_attn_probs=return_attn_probs,
+            key_padding_mask=key_padding_mask,
             heads_k_stride=heads_k_stride,
             softmax_scale=softmax_scale,
             dropout_p=dropout_p,
-            # causal=causal,
-            attn_q_chunk_size=None,
+            causal=causal,
+            attn_q_chunk_size=attn_q_chunk_size,
             time_event=time_event,
         )
         time_event.synchronize()
         # logging.debug(f"out {out[0,:2,3,:4]} out {softmax_lse[0,:2,:5]}")     
         # this should be out_padded
         ctx.save_for_backward(q, k, v, out, probs)
+        ctx.key_padding_mask = key_padding_mask
 
         ctx.dropout_p = dropout_p
         ctx.softmax_scale = softmax_scale
         ctx.process_group = process_group
         ctx.bwd_event_sync = bwd_event_sync
         ctx.heads_k_stride = heads_k_stride
-        ctx.attn_q_chunk_size = None
+        ctx.attn_q_chunk_size = attn_q_chunk_size
+        ctx.causal = causal
         return out if not return_attn_probs else (out, probs)
 
     @staticmethod
@@ -68,13 +71,12 @@ class LlamaStandardAttn(torch.autograd.Function):
             v,
             out,
             probs=probs,
-            # heads_k_stride=ctx.heads_k_stride,
+            heads_k_stride=ctx.heads_k_stride,
+            attn_q_chunk_size=ctx.attn_q_chunk_size,
+            key_padding_mask=ctx.key_padding_mask,
             softmax_scale=ctx.softmax_scale,
             dropout_p=ctx.dropout_p,
             causal=ctx.causal,
-            window_size=ctx.window_size,
-            alibi_slopes=ctx.alibi_slopes,
-            deterministic=ctx.deterministic,
             time_event=time_event,
         )
         if ctx.bwd_event_sync:
@@ -92,8 +94,8 @@ def llama_standard_attn_forward(
     dropout_p: float = 0.0,
     key_padding_mask: Optional[torch.Tensor] = None,
     softmax_scale: Optional[float] = None,
-    #causal: bool = False,  # TODO: To implement
-    # time_event=None,  # Sync GPU,CPU to lower vRAM allocation; no sync by default
+    causal: bool = False,  # TODO: To implement
+    time_event=None,  # Sync GPU,CPU to lower vRAM allocation; no sync by default
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """
     Forward pass for the Llama standard attention module.
@@ -110,8 +112,7 @@ def llama_standard_attn_forward(
         key_padding_mask (Optional[torch.Tensor]): Boolean mask for padding in keys.
             Shape (batch_size, local_seq_len_kv). True for valid tokens, False for padding.
         softmax_scale (Optional[float]): Scale for softmax. Defaults to 1/sqrt(head_dim).
-        causal (bool): Whether to apply causal masking.
-        return_attn_probs (bool): Whether to return attention probabilities.
+        causal (bool): Whether to apply causal masking. NOT IMPLEMENTED YET.
 
     Returns:
         torch.Tensor: Output of the attention mechanism, shape (batch_size, local_seq_len_q, num_q_heads, head_dim).
@@ -122,7 +123,7 @@ def llama_standard_attn_forward(
     _, _, num_kv_heads, _ = k.shape
     assert num_q_heads == num_kv_heads
     assert num_q_heads % heads_k_stride == 0
-
+    assert causal is False, "Causal masking is not implemented yet."
 
     gathered_key_padding_mask = key_padding_mask
     
@@ -185,6 +186,7 @@ def llama_standard_attn_forward(
                 q_i,
                 k_i,
                 v_i,
+                softmax_scale=softmax_scale,
                 attn_q_chunk_size=attn_q_chunk_size,
                 dropout_p=dropout_p,
                 key_padding_mask=gathered_key_padding_mask,
@@ -241,8 +243,6 @@ def chunked_query_self_attn(
     _, _, global_seq_len_kv, _ = k.shape
     if attn_q_chunk_size is None:
         attn_q_chunk_size = local_seq_len_q
-    if local_seq_len_q % attn_q_chunk_size:
-        attn_q_chunk_size += 1
 
     all_attn_output = torch.empty(
         (batch_size, num_q_heads, local_seq_len_q, head_dim),
@@ -275,7 +275,7 @@ def chunked_query_self_attn(
     return all_attn_output, all_attn_probs
 
 
-def ring_flash_attn_backward(
+def llama_standard_attn_backward(
     process_group,
     dout,
     q,
@@ -289,12 +289,14 @@ def ring_flash_attn_backward(
     key_padding_mask,
     dropout_p=0.0,
     causal=False,
+    time_event: Optional[torch.cuda.Event] = None,
 ):
     nheads = q.shape[1]
     batch_k, seq_k, nheads_k, head_dim = k.shape
     assert nheads_k % heads_k_stride == 0
 
     q, k, v = rearrange([q, k, v], 'qkv b s h d -> qkv b h s d')
+    dout = rearrange(dout, 'b s h d -> b h s d')
 
     dq = torch.empty_like(q)
     dk = torch.empty_like(k)
@@ -340,7 +342,8 @@ def ring_flash_attn_backward(
 
         for i in range(0, nheads_k, heads_k_stride):
             dkv_buffer.zero_()
-
+            if time_event is not None and i == nheads_k - heads_k_stride:
+                time_event.record()
             q_slice = slice(
                 i * nheads // nheads_k, (i + heads_k_stride) * nheads // nheads_k
             )
@@ -377,8 +380,9 @@ def ring_flash_attn_backward(
                 dq=dq_i,
                 dk=dk_i,
                 dv=dv_i,
-                attn_q_chunk_size=attn_q_chunk_size[:, q_slice],
+                attn_q_chunk_size=attn_q_chunk_size,
                 dropout_p=dropout_p,
+                softmax_scale=softmax_scale,
                 key_padding_mask=gathered_key_padding_mask,
                 causal=causal,  # TODO: To implement
             )
@@ -396,8 +400,28 @@ def ring_flash_attn_backward(
             if heads_k_stride != nheads_k:
                 dk[:, i : i + heads_k_stride] = dk_i
                 dv[:, i : i + heads_k_stride] = dv_i
+    else: # Single process, no communication needed
+        for i in range(0, nheads_k, heads_k_stride):
+            q_head_slice = slice(i, i + heads_k_stride)
 
+            q_i = q[:, q_head_slice, :, :]
+            k_i = k[:, i : i + heads_k_stride, :, :] # k is already local
+            v_i = v[:, i : i + heads_k_stride, :, :] # v is already local
+            dout_i = dout[:, q_head_slice, :, :]
+            probs_i = probs[:, q_head_slice, :, :]
+            
+            dq_view = dq[:, q_head_slice, :, :]
+            dk_view = dk[:, i : i + heads_k_stride, :, :]
+            dv_view = dv[:, i : i + heads_k_stride, :, :]
+
+            chunked_query_self_attn_backward(
+                dout=dout_i, q=q_i, k=k_i, v=v_i, probs=probs_i,
+                dq=dq_view, dk=dk_view, dv=dv_view,
+                attn_q_chunk_size=attn_q_chunk_size, dropout_p=dropout_p,
+                softmax_scale=softmax_scale, key_padding_mask=key_padding_mask, causal=causal,
+            )
     return dq, dk, dv
+
 
 def chunked_query_self_attn_backward(
     dout: torch.Tensor,

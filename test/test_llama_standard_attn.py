@@ -3,38 +3,6 @@ import torch
 import torch.nn.functional as F
 from ring_flash_attn.llama_standard_attn import chunked_query_self_attn, chunked_query_self_attn_backward
 
-# --- START: User-defined functions (replace with actual implementations) ---
-# These are placeholders for your actual `chunked_query_self_attn` 
-# and `chunked_query_self_attn_backward` functions.
-# For this example, they mimic PyTorch's behavior so the test passes.
-# You should replace these with your own code.
-
-def chunked_query_self_attn(q_in, k_in, v_in, softmax_scale_in, attn_q_chunk_size):
-    """
-    Placeholder for the user's chunked_query_self_attn function.
-    Replace this with your actual implementation.
-    This example uses F.scaled_dot_product_attention for output
-    and calculates probs manually for demonstration.
-    """
-    # This would be your custom forward implementation.
-    # For the placeholder, we mimic the expected output.
-    output_val = F.scaled_dot_product_attention(
-        q_in, k_in, v_in, attn_mask=None, dropout_p=0.0, is_causal=False, scale=softmax_scale_in
-    )
-    
-    # Calculate probs as they would be for standard attention, for use in the custom backward.
-    # S = Q K^T * scale
-    # P = softmax(S)
-    scores = torch.matmul(q_in, k_in.transpose(-2, -1)) * softmax_scale_in
-    probs_val = F.softmax(scores, dim=-1)
-    
-    return output_val, probs_val
-
-
-
-
-# --- END: User-defined functions ---
-
 
 class TestAttention(unittest.TestCase):
     def test_attention_equivalence(self):
