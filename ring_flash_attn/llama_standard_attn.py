@@ -131,7 +131,7 @@ def llama_standard_attn_forward(
 
     if softmax_scale is None:
         softmax_scale = 1.0 / (head_dim**0.5)
-    q = q * softmax_scale
+    # softmax_scale applied on attn_scores instead of q for ease of testing
 
     output_list: List[torch.Tensor] = []
     probs_list: List[torch.Tensor] = []
@@ -202,6 +202,7 @@ def llama_standard_attn_forward(
                 q_i,
                 k_i,
                 v_i,
+                softmax_scale=softmax_scale,
                 attn_q_chunk_size=attn_q_chunk_size,
                 dropout_p=dropout_p,
                 key_padding_mask=key_padding_mask
@@ -285,6 +286,7 @@ def ring_flash_attn_backward(
     heads_k_stride,
     softmax_scale,
     attn_q_chunk_size,
+    key_padding_mask,
     dropout_p=0.0,
     causal=False,
 ):
