@@ -419,6 +419,7 @@ def llama_standard_attn_backward(
                 attn_q_chunk_size=attn_q_chunk_size, dropout_p=dropout_p,
                 softmax_scale=softmax_scale, key_padding_mask=key_padding_mask, causal=causal,
             )
+    dq, dk, dv = rearrange([dq, dk, dv], 'qkv b h s d -> qkv b s h d')
     return dq, dk, dv
 
 
