@@ -372,12 +372,12 @@ def llama_standard_attn_backward(
                 comm.all_gather(kv_buffer_copy[0], send_k)
                 comm.all_gather(kv_buffer_copy[1], send_v)
 
-            # kv_buffer[0] has shape (batch_k, seq_k, world_size, heads_k_stride, head_dim)
-            # We want k_i to be (batch_k, seq_k * world_size, heads_k_stride, head_dim)
-            k_i = kv_buffer[0,group_rank,head_slice]
-            v_i = kv_buffer[1,group_rank,head_slice]
-            dk_i = dkv_buffer[0,group_rank,head_slice]
-            dv_i = dkv_buffer[1,group_rank,head_slice]
+            # kv_buffer[0] has shape (world_size, batch_k, heads_k_stride, seq_k, head_dim)
+            # We want k_i to be (<rank>, batch_k, heads_k_stride, seq_k, head_dim)
+            k_i = kv_buffer[0, group_rank, :, head_slice]
+            v_i = kv_buffer[1, group_rank, :, head_slice]
+            dk_i = dkv_buffer[0, group_rank, :, head_slice]
+            dv_i = dkv_buffer[1, group_rank, :, head_slice]
 
             chunked_query_self_attn_backward(
                 dout=dout_i,
