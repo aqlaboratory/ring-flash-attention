@@ -69,7 +69,6 @@ class LlamaStandardAttn(torch.autograd.Function):
             q,
             k,
             v,
-            out,
             probs=probs,
             heads_k_stride=ctx.heads_k_stride,
             attn_q_chunk_size=ctx.attn_q_chunk_size,
