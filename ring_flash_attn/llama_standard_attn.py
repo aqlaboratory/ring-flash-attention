@@ -150,6 +150,11 @@ def llama_standard_attn_forward(
             device=k.device,
         )
         kv_buffer_copy = torch.empty_like(kv_buffer)
+        probs_out = torch.zeros(
+            (batch_size, num_kv_heads, local_seq_len_q, local_seq_len_q * world_size),
+            dtype=k.dtype,
+            device=k.device,
+        )
 
         k_0 = k[:, :heads_k_stride, :].contiguous()
         v_0 = v[:, :heads_k_stride, :].contiguous()
@@ -191,10 +196,16 @@ def llama_standard_attn_forward(
                 key_padding_mask=gathered_key_padding_mask,
             )
             output_list.append(output)
-            probs_list.append(probs)
+            # probs_list.append(probs)
+            probs_out[:, i : (i + heads_k_stride), :, :] = probs
     else: # Single process, no all_gather needed
         # Loop over head strides for consistency, though not strictly necessary for single GPU
         # if heads_k_stride == num_kv_heads
+        probs_out = torch.zeros(
+            (batch_size, num_kv_heads, local_seq_len_q, local_seq_len_q),
+            dtype=k.dtype,
+            device=k.device,
+        )
         for i in range(0, num_kv_heads, heads_k_stride):
             q_i = q[:, i : (i + heads_k_stride)]
             k_i = k[:, i : (i + heads_k_stride)]
@@ -209,12 +220,13 @@ def llama_standard_attn_forward(
                 key_padding_mask=key_padding_mask
             )
             output_list.append(output)
-            probs_list.append(probs)
+            # probs_list.append(probs)
+            probs_out[:, i : (i + heads_k_stride), :, :] = probs
     # output concat heads [B H S D]; S is the local sequence length
     output = rearrange(output_list,'hstride b h s d -> b s (hstride h) d')
     # probs concat heads [B H Sq Sk]; Sq is local sequence length of q
-    probs = rearrange(probs_list,'hstride b h sq sk -> b (hstride h) sq sk')
-    return output, probs
+    # probs = rearrange(probs_list,'hstride b h sq sk -> b (hstride h) sq sk')
+    return output, probs_out  #probs
 
 
 def chunked_query_self_attn(
