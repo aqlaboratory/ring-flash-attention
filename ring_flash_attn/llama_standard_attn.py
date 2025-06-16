@@ -13,11 +13,11 @@ class LlamaStandardAttn(torch.autograd.Function):
         q,
         k,
         v,
-        heads_k_stride,
-        dropout_p,
-        softmax_scale,
+        heads_k_stride=1,  # default 1 always works, but need optimize
+        dropout_p=0.0,
+        softmax_scale=None,
         key_padding_mask=None,
-        attn_q_chunk_size=None,
+        attn_q_chunk_size=128,  # default 128 q tokens per chunk
         causal=False,  # TODO: To implement
         return_attn_probs=False,
         process_group=None,
@@ -45,7 +45,7 @@ class LlamaStandardAttn(torch.autograd.Function):
         time_event.synchronize()
         # logging.debug(f"out {out[0,:2,3,:4]} out {softmax_lse[0,:2,:5]}")     
         # this should be out_padded
-        ctx.save_for_backward(q, k, v, out, probs)
+        ctx.save_for_backward(q, k, v, probs)  # don't need out
         ctx.key_padding_mask = key_padding_mask
 
         ctx.dropout_p = dropout_p
@@ -62,7 +62,7 @@ class LlamaStandardAttn(torch.autograd.Function):
         time_event = None
         if ctx.bwd_event_sync:
             time_event = torch.cuda.Event(enable_timing=False)
-        q, k, v, out, probs = ctx.saved_tensors
+        q, k, v, probs = ctx.saved_tensors  # don't need out
         dq, dk, dv = llama_standard_attn_backward(
             ctx.process_group,
             dout,
@@ -281,7 +281,7 @@ def llama_standard_attn_backward(
     q,
     k,
     v,
-    out,
+    # out,
     probs,
     heads_k_stride,
     softmax_scale,
@@ -349,7 +349,7 @@ def llama_standard_attn_backward(
             )
             q_i = q[:, q_slice]
             dout_i = dout[:, q_slice]
-            out_i = out[:, q_slice]
+            # out_i = out[:, q_slice]
             dq_i = dq[:, q_slice]
             comm.wait()
             kv_buffer, kv_buffer_copy = kv_buffer_copy, kv_buffer
@@ -375,7 +375,7 @@ def llama_standard_attn_backward(
                 q=q_i,
                 k=k_i,
                 v=v_i,
-                out=out_i,
+                # out=out_i,
                 probs=probs[:,kv_slice_left:kv_slice_right],
                 dq=dq_i,
                 dk=dk_i,
@@ -445,7 +445,6 @@ def chunked_query_self_attn_backward(
     by the caller if this is the first accumulation step for them. dq is a slice
     that will be directly written to.
     Shapes:
-        dout: (batch_size, num_heads, local_seq_len_q_total, head_dim)
         q:    (batch_size, num_heads, local_seq_len_q_total, head_dim)
         k:    (batch_size, num_heads, global_seq_len_kv_total, head_dim)
         v:    (batch_size, num_heads, global_seq_len_kv_total, head_dim)
@@ -551,13 +550,13 @@ def llama_standard_attn_func(
         q,
         k,
         v,
-        softmax_scale=softmax_scale,
-        key_padding_mask=key_padding_mask,
-        heads_k_stride=heads_k_stride,
-        dropout_p=dropout_p,
-        causal=causal,
-        attn_q_chunk_size=attn_q_chunk_size,
-        return_attn_probs=return_attn_probs,
-        process_group=group,
-        bwd_event_sync=bwd_event_sync,
+        heads_k_stride,
+        dropout_p,
+        softmax_scale,
+        key_padding_mask,
+        attn_q_chunk_size,
+        causal,
+        return_attn_probs,
+        process_group,
+        bwd_event_sync,
     )
