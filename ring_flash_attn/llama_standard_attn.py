@@ -262,7 +262,7 @@ def chunked_query_self_attn(
         if key_padding_mask is not None:
             mask_to_apply = key_padding_mask.view(batch_size, 1, 1, global_seq_len_kv)
             attn_score = attn_score.masked_fill(
-                mask_to_apply == False, float('-inf'))
+                ~mask_to_apply, float('-inf'))
         attn_probs = torch.softmax(attn_score, dim=-1).type_as(q)
         if dropout_p > 0.0:
             # TODO: Check if this is correct dropout application
@@ -509,3 +509,55 @@ def chunked_query_self_attn_backward(
         # then dK_orig = ((Q_orig_chunk * softmax_scale).T @ dS_c) * softmax_scale
         dk_increment = (ds_c.transpose(-2, -1) @ q_c) * softmax_scale
         dk += dk_increment # Accumulate into the provided dk tensor
+
+def llama_standard_attn_func(
+    q,
+    k,
+    v,
+    heads_k_stride=1,  # default 1 always works, but need optimize
+    dropout_p=0.0,
+    softmax_scale=None,
+    key_padding_mask=None,
+    attn_q_chunk_size=None,
+    causal=False,
+    return_attn_probs=False,
+    group=None,
+    bwd_event_sync=False,
+):
+    '''Llama standard attention function.
+    Differs from flash_attn interface by missing:
+        window_size=(-1, -1),
+        alibi_slopes=None,
+        deterministic=False,
+
+    Args:
+        q (torch.Tensor): Query tensor shape [B S H D].
+        k (torch.Tensor): Key tensor [B S H D].
+        v (torch.Tensor): Value tensor [B S H D].
+        heads_k_stride (int): Number of key heads to process in one step.
+        dropout_p (float): Dropout probability. TODO: Not tested.
+        softmax_scale (Optional[float]): Scale for softmax. Defaults to 1/sqrt(head_dim).
+        key_padding_mask (Optional[torch.Tensor]): Mask for padding in keys.
+        attn_q_chunk_size (Optional[int]): Chunk size for query attention.
+        causal (bool): Whether to apply causal masking. NOT IMPLEMENTED YET.
+        return_attn_probs (bool): Whether to return attention probabilities.
+        group (Optional[dist.ProcessGroup]): Process group for distributed operations.
+        bwd_event_sync (bool): Whether to synchronize backward events.
+    Returns:
+        torch.Tensor: Output tensor of shape (batch_size, local_seq_len_q, num_q_heads, head_dim).
+        Optional[torch.Tensor]: Attention probabilities if return_attn_probs is True, else None.
+    '''
+    return LlamaStandardAttn.apply(
+        q,
+        k,
+        v,
+        heads_k_stride,
+        dropout_p,
+        softmax_scale,
+        causal,
+        key_padding_mask,
+        attn_q_chunk_size,
+        return_attn_probs,
+        group,
+        bwd_event_sync,
+    )
