@@ -317,6 +317,7 @@ def llama_standard_attn_backward(
     if process_group is not None:
         comm = Comm(process_group)
         world_size = dist.get_world_size(process_group)
+        rank = dist.get_rank()
 
         if key_padding_mask is not None:
             mask_list = [torch.empty_like(key_padding_mask) for _ in range(world_size)]
@@ -324,7 +325,6 @@ def llama_standard_attn_backward(
             gathered_key_padding_mask = torch.cat(mask_list, dim=1)
 
 
-        world_size = dist.get_world_size(process_group)
         kv_buffer = torch.empty(
             (2, world_size, batch_k, heads_k_stride, local_seq_len_q, head_dim),
             dtype=k.dtype,
@@ -352,13 +352,14 @@ def llama_standard_attn_backward(
             dkv_buffer.zero_()
             if time_event is not None and i == nheads_k - heads_k_stride:
                 time_event.record()
-            q_slice = slice(
+            head_slice = slice(
                 i * nheads // nheads_k, (i + heads_k_stride) * nheads // nheads_k
             )
-            q_i = q[:, q_slice]
-            dout_i = dout[:, q_slice]
-            # out_i = out[:, q_slice]
-            dq_i = dq[:, q_slice]
+            # kv_seq_slice = slice(rank * local_seq_len_q, (rank + 1) * local_seq_len_q)
+            q_i = q[:, head_slice]
+            dout_i = dout[:, head_slice]
+            # out_i = out[:, head_slice]
+            dq_i = dq[:, head_slice]
             comm.wait()
             kv_buffer, kv_buffer_copy = kv_buffer_copy, kv_buffer
 
@@ -373,10 +374,10 @@ def llama_standard_attn_backward(
 
             # kv_buffer[0] has shape (batch_k, seq_k, world_size, heads_k_stride, head_dim)
             # We want k_i to be (batch_k, seq_k * world_size, heads_k_stride, head_dim)
-            k_i = rearrange(kv_buffer[0], 'w b s hs dh -> b (w s) hs dh')
-            v_i = rearrange(kv_buffer[1], 'w b s hs dh -> b (w s) hs dh')
-            dk_i = rearrange(dkv_buffer[0], 'w b s hs dh -> b (w s) hs dh')
-            dv_i = rearrange(dkv_buffer[1], 'w b s hs dh -> b (w s) hs dh')
+            k_i = rearrange(kv_buffer[0,rank,head_slice], 'w b s hs dh -> b (w s) hs dh')
+            v_i = rearrange(kv_buffer[1,rank,head_slice], 'w b s hs dh -> b (w s) hs dh')
+            dk_i = rearrange(dkv_buffer[0,rank,head_slice], 'w b s hs dh -> b (w s) hs dh')
+            dv_i = rearrange(dkv_buffer[1,rank,head_slice], 'w b s hs dh -> b (w s) hs dh')
 
             chunked_query_self_attn_backward(
                 dout=dout_i,
