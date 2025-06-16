@@ -290,7 +290,7 @@ def llama_standard_attn_backward(
     causal=False,
     time_event: Optional[torch.cuda.Event] = None,
 ):
-    nheads = q.shape[1]
+    _, local_seq_len_q, nheads, head_dim = q.shape
     batch_k, seq_k, nheads_k, head_dim = k.shape
     assert nheads_k % heads_k_stride == 0
 
@@ -311,23 +311,20 @@ def llama_standard_attn_backward(
             dist.all_gather(mask_list, key_padding_mask.contiguous(), group=process_group)
             gathered_key_padding_mask = torch.cat(mask_list, dim=1)
 
+
         world_size = dist.get_world_size(process_group)
         kv_buffer = torch.empty(
-            (2, world_size, batch_k, heads_k_stride, head_dim),
+            (2, world_size, batch_k, heads_k_stride, local_seq_len_q, head_dim),
             dtype=k.dtype,
             device=k.device,
         )
         kv_buffer_copy = torch.empty_like(kv_buffer)
 
-        dkv_buffer = torch.empty(
-            (2, world_size, batch_k, heads_k_stride, head_dim),
-            dtype=k.dtype,
-            device=k.device,
-        )
+        dkv_buffer = torch.empty_like(kv_buffer)
 
         if heads_k_stride != nheads_k:
             kv_contiguous_buffer = torch.empty(
-                (2, world_size, batch_k, heads_k_stride, head_dim),
+                (2, batch_k, heads_k_stride, local_seq_len_q, head_dim),
                 dtype=k.dtype,
                 device=k.device,
             )
@@ -400,22 +397,25 @@ def llama_standard_attn_backward(
                 dk[:, i : i + heads_k_stride] = dk_i
                 dv[:, i : i + heads_k_stride] = dv_i
     else: # Single process, no communication needed
+        dq.zero_()
+        dk.zero_()
+        dv.zero_()
         for i in range(0, nheads_k, heads_k_stride):
             q_head_slice = slice(i, i + heads_k_stride)
 
             q_i = q[:, q_head_slice, :, :]
-            k_i = k[:, i : i + heads_k_stride, :, :] # k is already local
-            v_i = v[:, i : i + heads_k_stride, :, :] # v is already local
+            k_i = k[:, q_head_slice, :, :] # k is already local
+            v_i = v[:, q_head_slice, :, :] # v is already local
             dout_i = dout[:, q_head_slice, :, :]
             probs_i = probs[:, q_head_slice, :, :]
             
-            dq_view = dq[:, q_head_slice, :, :]
-            dk_view = dk[:, i : i + heads_k_stride, :, :]
-            dv_view = dv[:, i : i + heads_k_stride, :, :]
+            dq_i = dq[:, q_head_slice, :, :]
+            dk_i = dk[:, q_head_slice, :, :]
+            dv_i = dv[:, q_head_slice, :, :]
 
             chunked_query_self_attn_backward(
                 dout=dout_i, q=q_i, k=k_i, v=v_i, probs=probs_i,
-                dq=dq_view, dk=dk_view, dv=dv_view,
+                dq=dq_i, dk=dk_i, dv=dv_i,
                 attn_q_chunk_size=attn_q_chunk_size, dropout_p=dropout_p,
                 softmax_scale=softmax_scale, key_padding_mask=key_padding_mask, causal=causal,
             )

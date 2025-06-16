@@ -215,7 +215,7 @@ class TestAttention(unittest.TestCase):
                 v,
                 softmax_scale=softmax_scale,
                 key_padding_mask=key_padding_mask.detach().clone().to(device) if key_padding_mask is not None else None,
-                attn_q_chunk_size=2, # This parameter is specific to your custom function
+                attn_q_chunk_size=8, # This parameter is specific to your custom function
             )
             
             # Prepare gradient tensors for custom backward pass
@@ -233,7 +233,7 @@ class TestAttention(unittest.TestCase):
                 probs=probs,
                 dq=dq,
                 dk=dk,
-                attn_q_chunk_size=2, # This parameter is specific to your custom function
+                attn_q_chunk_size=8, # This parameter is specific to your custom function
                 dropout_p=0.0,
                 softmax_scale=softmax_scale,
                 key_padding_mask=key_padding_mask,
