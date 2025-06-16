@@ -55,7 +55,7 @@ class LlamaStandardAttn(torch.autograd.Function):
         ctx.heads_k_stride = heads_k_stride
         ctx.attn_q_chunk_size = attn_q_chunk_size
         ctx.causal = causal
-        return out if not return_attn_probs else (out, probs)
+        return (out, None) if not return_attn_probs else (out, probs)
 
     @staticmethod
     def backward(ctx, dout, *args):
