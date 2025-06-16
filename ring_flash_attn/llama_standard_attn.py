@@ -557,6 +557,6 @@ def llama_standard_attn_func(
         attn_q_chunk_size,
         causal,
         return_attn_probs,
-        process_group,
+        group,
         bwd_event_sync,
     )
