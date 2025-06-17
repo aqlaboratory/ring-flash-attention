@@ -134,7 +134,7 @@ def llama_standard_attn_forward(
     # softmax_scale applied on attn_scores instead of q for ease of testing
 
     output_list: List[torch.Tensor] = []
-    probs_list: List[torch.Tensor] = []
+    # probs_list: List[torch.Tensor] = []
     if process_group is not None:
         comm = Comm(process_group)
         world_size = dist.get_world_size(process_group)
@@ -159,7 +159,7 @@ def llama_standard_attn_forward(
         k_0 = k[:, :heads_k_stride, :].contiguous()
         v_0 = v[:, :heads_k_stride, :].contiguous()
 
-        comm = Comm(process_group)
+        # comm = Comm(process_group)
         # Pass the main tensor slices to all_gather
         comm.all_gather(kv_buffer_copy[0], k_0)
         comm.all_gather(kv_buffer_copy[1], v_0)
@@ -341,7 +341,6 @@ def llama_standard_attn_backward(
                 device=k.device,
             )
 
-        comm = Comm(process_group)
 
         k_0 = k[:, :heads_k_stride].contiguous()
         v_0 = v[:, :heads_k_stride].contiguous()
@@ -374,15 +373,15 @@ def llama_standard_attn_backward(
 
             # kv_buffer[0] has shape (world_size, batch_k, heads_k_stride, seq_k, head_dim)
             # We want k_i to be (batch_k, heads_k_stride, world_size * seq_k, head_dim)
-            # k_i, v_i = rearrange(
-            #     kv_buffer, 'two w b hs sk dh -> two b hs (w sk) dh', two=2)
-            # dk_i, dv_i = rearrange(
-            #     dkv_buffer, 'two w b hs sk dh -> two b hs (w sk) dh', two=2)
-            # maybe you shouldn't use rearrange here; not sure if it's a copy
-            k_i = rearrange(kv_buffer[0], 'w b hs sk dh -> b hs (w sk) dh')
-            v_i = rearrange(kv_buffer[1], 'w b hs sk dh -> b hs (w sk) dh')
-            dk_i = rearrange(dkv_buffer[0], 'w b hs sk dh -> b hs (w sk) dh')
-            dv_i = rearrange(dkv_buffer[1], 'w b hs sk dh -> b hs (w sk) dh')
+            k_i, v_i = rearrange(
+                kv_buffer, 'two w b hs sk dh -> two b hs (w sk) dh', two=2)
+            dk_i, dv_i = rearrange(
+                dkv_buffer, 'two w b hs sk dh -> two b hs (w sk) dh', two=2)
+            #  it's a copy
+            # k_i = rearrange(kv_buffer[0], 'w b hs sk dh -> b hs (w sk) dh')
+            # v_i = rearrange(kv_buffer[1], 'w b hs sk dh -> b hs (w sk) dh')
+            # dk_i = rearrange(dkv_buffer[0], 'w b hs sk dh -> b hs (w sk) dh')
+            # dv_i = rearrange(dkv_buffer[1], 'w b hs sk dh -> b hs (w sk) dh')
 
             chunked_query_self_attn_backward(
                 dout=dout_i,
@@ -400,8 +399,14 @@ def llama_standard_attn_backward(
                 key_padding_mask=gathered_key_padding_mask,
                 causal=causal,  # TODO: To implement
             )
+            dkv_buffer = rearrange(
+                [dk_i, dv_i], 'two b hs (w sk) dh -> two w b hs sk dh', two=2, w=world_size
+            )
+            # dkv_buffer[0] = rearrange(dk_i, 'b hs (w sk) dh -> w b hs sk dh', w=world_size)
+            # dkv_buffer[1] = rearrange(dv_i, 'b hs (w sk) dh -> w b hs sk dh', w=world_size)
             if heads_k_stride != nheads_k:
                 # reduce_scatter needs contiguous buffer
+                # dk_i dv_i is not a pointer to kv_buffer[0] and kv_buffer[1]
                 dk_i = kv_contiguous_buffer[0]
                 dv_i = kv_contiguous_buffer[1]
             else:
