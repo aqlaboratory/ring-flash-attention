@@ -475,10 +475,10 @@ def chunked_query_self_attn_backward(
     k: torch.Tensor,
     v: torch.Tensor,
     # out: torch.Tensor,
+    dq: torch.Tensor,
+    dk: torch.Tensor,
     dv: torch.Tensor,
     probs: Optional[torch.Tensor] = None,
-    dq: Optional[torch.Tensor] = None,
-    dk: Optional[torch.Tensor] = None,
     attn_q_chunk_size: Optional[int] = None,
     dropout_p: float = 0.0,
     softmax_scale: float = 1.0,
@@ -500,7 +500,7 @@ def chunked_query_self_attn_backward(
         dv:   (batch_size, num_heads, global_seq_len_kv_total, head_dim) (accumulated output)
     """
     batch_size, num_heads, local_seq_len_q_total, head_dim = q.shape
-
+    dk, dv = dk.float(), dv.float()  # Gradients are float for summation
     if attn_q_chunk_size is None or attn_q_chunk_size <= 0:
         attn_q_chunk_size = local_seq_len_q_total
 
@@ -520,7 +520,7 @@ def chunked_query_self_attn_backward(
         # Grad w.r.t. V: dv_contrib = P.T @ dO
         # dv_update shape: (B, H, S_k_total, D)
         dv_update = probs_c.transpose(-2, -1) @ dout_c
-        dv += dv_update # Accumulate into the provided dv tensor
+        dv += dv_update.float() # Accumulate into the provided dv tensor
 
         # Grad w.r.t. P_dropped (attention probabilities after dropout)
         # dP_dropped = dO @ V.T
@@ -551,7 +551,8 @@ def chunked_query_self_attn_backward(
         # If q_c is Q_orig_chunk * softmax_scale (i.e., pre-scaled query chunk),
         # then dK_orig = ((Q_orig_chunk * softmax_scale).T @ dS_c) * softmax_scale
         dk_increment = (ds_c.transpose(-2, -1) @ q_c) * softmax_scale
-        dk += dk_increment # Accumulate into the provided dk tensor
+        dk += dk_increment.float() # Accumulate into the provided dk tensor
+    dk, dv = dk.type_as(q), dv.type_as(q)  # Gradients are float for summation
 
 def llama_standard_attn_func(
     q,
