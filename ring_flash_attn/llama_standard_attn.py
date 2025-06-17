@@ -22,6 +22,7 @@ class LlamaStandardAttn(torch.autograd.Function):
         return_attn_probs=False,
         process_group=None,
         bwd_event_sync=False,
+        recompute_bwd=False,
     ):
         time_event = torch.cuda.Event(enable_timing=False)
         if softmax_scale is None:
@@ -45,6 +46,8 @@ class LlamaStandardAttn(torch.autograd.Function):
         time_event.synchronize()
         # logging.debug(f"out {out[0,:2,3,:4]} out {softmax_lse[0,:2,:5]}")     
         # this should be out_padded
+        if recompute_bwd:
+            probs = None
         ctx.save_for_backward(q, k, v, probs)  # don't need out
         ctx.key_padding_mask = key_padding_mask
 
@@ -55,6 +58,7 @@ class LlamaStandardAttn(torch.autograd.Function):
         ctx.heads_k_stride = heads_k_stride
         ctx.attn_q_chunk_size = attn_q_chunk_size
         ctx.causal = causal
+        ctx.recompute_bwd = recompute_bwd
         return (out, None) if not return_attn_probs else (out, probs)
 
     @staticmethod
@@ -77,6 +81,7 @@ class LlamaStandardAttn(torch.autograd.Function):
             dropout_p=ctx.dropout_p,
             causal=ctx.causal,
             time_event=time_event,
+            recompute_bwd=ctx.recompute_bwd,
         )
         if ctx.bwd_event_sync:
             time_event.synchronize()
@@ -302,6 +307,7 @@ def llama_standard_attn_backward(
     dropout_p=0.0,
     causal=False,
     time_event: Optional[torch.cuda.Event] = None,
+    recompute_bwd=False,  # If True, recompute probs in backward
 ):
     _, local_seq_len_q, nheads, head_dim = q.shape
     batch_k, seq_k, nheads_k, head_dim = k.shape
@@ -382,6 +388,17 @@ def llama_standard_attn_backward(
             # v_i = rearrange(kv_buffer[1], 'w b hs sk dh -> b hs (w sk) dh')
             # dk_i = rearrange(dkv_buffer[0], 'w b hs sk dh -> b hs (w sk) dh')
             # dv_i = rearrange(dkv_buffer[1], 'w b hs sk dh -> b hs (w sk) dh')
+            if recompute_bwd:
+                _, probs = chunked_query_self_attn(
+                    q_i,
+                    k_i,
+                    v_i,
+                    softmax_scale=softmax_scale,
+                    attn_q_chunk_size=attn_q_chunk_size,
+                    dropout_p=dropout_p,
+                    key_padding_mask=gathered_key_padding_mask,
+                )
+
 
             chunked_query_self_attn_backward(
                 dout=dout_i,
