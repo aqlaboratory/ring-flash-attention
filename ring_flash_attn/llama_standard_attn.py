@@ -564,6 +564,7 @@ def llama_standard_attn_func(
     return_attn_probs=False,
     group=None,
     bwd_event_sync=False,
+    recompute_bwd=False
 ):
     '''Llama standard attention function.
     Differs from flash_attn interface by missing:
@@ -601,4 +602,5 @@ def llama_standard_attn_func(
         return_attn_probs,
         group,
         bwd_event_sync,
+        recompute_bwd,
     )
