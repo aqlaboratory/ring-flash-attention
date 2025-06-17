@@ -165,7 +165,9 @@ def llama_standard_attn_forward(
         comm.all_gather(kv_buffer_copy[1], v_0)
 
         for i in range(0, num_kv_heads, heads_k_stride):
-
+            # Optimization: No sync on last head stride
+            if (i == num_kv_heads - heads_k_stride) and (time_event is not None):
+                time_event.record()
             comm.wait()
             # Swap the main storage tensors
             kv_buffer, kv_buffer_copy = kv_buffer_copy, kv_buffer
@@ -220,13 +222,12 @@ def llama_standard_attn_forward(
                 key_padding_mask=key_padding_mask
             )
             output_list.append(output)
-            # probs_list.append(probs)
+            # rearrange(list[Tensor]) create spike in memory. Do inplace assignment
+            # [B H Sq Sk]; Sq is local sequence length of q
             probs_out[:, i : (i + heads_k_stride), :, :] = probs
     # output concat heads [B H S D]; S is the local sequence length
     output = rearrange(output_list,'hstride b h s d -> b s (hstride h) d')
-    # probs concat heads [B H Sq Sk]; Sq is local sequence length of q
-    # probs = rearrange(probs_list,'hstride b h sq sk -> b (hstride h) sq sk')
-    return output, probs_out  #probs
+    return output, probs_out
 
 
 def chunked_query_self_attn(
@@ -372,11 +373,16 @@ def llama_standard_attn_backward(
                 comm.all_gather(kv_buffer_copy[1], send_v)
 
             # kv_buffer[0] has shape (world_size, batch_k, heads_k_stride, seq_k, head_dim)
-            # We want k_i to be (<rank>, batch_k, heads_k_stride, seq_k, head_dim)
-            k_i, v_i = rearrange(
-                kv_buffer, 'two w b hs sk dh -> two b hs (w sk) dh', two=2)
-            dk_i, dv_i = rearrange(
-                dkv_buffer, 'two w b hs sk dh -> two b hs (w sk) dh', two=2)
+            # We want k_i to be (batch_k, heads_k_stride, world_size * seq_k, head_dim)
+            # k_i, v_i = rearrange(
+            #     kv_buffer, 'two w b hs sk dh -> two b hs (w sk) dh', two=2)
+            # dk_i, dv_i = rearrange(
+            #     dkv_buffer, 'two w b hs sk dh -> two b hs (w sk) dh', two=2)
+            # maybe you shouldn't use rearrange here; not sure if it's a copy
+            k_i = rearrange(kv_buffer[0], 'w b hs sk dh -> b hs (w sk) dh')
+            v_i = rearrange(kv_buffer[1], 'w b hs sk dh -> b hs (w sk) dh')
+            dk_i = rearrange(dkv_buffer[0], 'w b hs sk dh -> b hs (w sk) dh')
+            dv_i = rearrange(dkv_buffer[1], 'w b hs sk dh -> b hs (w sk) dh')
 
             chunked_query_self_attn_backward(
                 dout=dout_i,
@@ -405,11 +411,11 @@ def llama_standard_attn_backward(
             dist.reduce_scatter_tensor(dk_i, dkv_buffer[0], group=process_group)
             dist.reduce_scatter_tensor(dv_i, dkv_buffer[1], group=process_group)
 
-            if heads_k_stride != nheads_k:
+            if heads_k_stride != nheads_k:  # b h s d
                 dk[:, i : i + heads_k_stride] = dk_i
                 dv[:, i : i + heads_k_stride] = dv_i
     else: # Single process, no communication needed
-        dq.zero_()
+        #dq.zero_()
         dk.zero_()
         dv.zero_()
         for i in range(0, nheads_k, heads_k_stride):
