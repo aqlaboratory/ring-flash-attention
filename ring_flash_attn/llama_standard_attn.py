@@ -317,7 +317,6 @@ def llama_standard_attn_backward(
     if process_group is not None:
         comm = Comm(process_group)
         world_size = dist.get_world_size(process_group)
-        group_rank = dist.get_group_rank(process_group, dist.get_rank())
 
         if key_padding_mask is not None:
             mask_list = [torch.empty_like(key_padding_mask) for _ in range(world_size)]
@@ -374,10 +373,10 @@ def llama_standard_attn_backward(
 
             # kv_buffer[0] has shape (world_size, batch_k, heads_k_stride, seq_k, head_dim)
             # We want k_i to be (<rank>, batch_k, heads_k_stride, seq_k, head_dim)
-            k_i = kv_buffer[0, group_rank, :, head_slice]
-            v_i = kv_buffer[1, group_rank, :, head_slice]
-            dk_i = dkv_buffer[0, group_rank, :, head_slice]
-            dv_i = dkv_buffer[1, group_rank, :, head_slice]
+            k_i, v_i = rearrange(
+                kv_buffer, 'two w b hs sk dh -> two b hs (w sk) dh', two=2)
+            dk_i, dv_i = rearrange(
+                dkv_buffer, 'two w b hs sk dh -> two b hs (w sk) dh', two=2)
 
             chunked_query_self_attn_backward(
                 dout=dout_i,
@@ -385,7 +384,7 @@ def llama_standard_attn_backward(
                 k=k_i,
                 v=v_i,
                 # out=out_i,
-                probs=probs[:,kv_slice_left:kv_slice_right],
+                probs=probs[:, head_slice],  # probs [B H Sq Sk]
                 dq=dq_i,
                 dk=dk_i,
                 dv=dv_i,
