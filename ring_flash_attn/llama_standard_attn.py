@@ -391,7 +391,7 @@ def llama_standard_attn_backward(
             # dk_i = rearrange(dkv_buffer[0], 'w b hs sk dh -> b hs (w sk) dh')
             # dv_i = rearrange(dkv_buffer[1], 'w b hs sk dh -> b hs (w sk) dh')
             if recompute_bwd:
-                _, probs = chunked_query_self_attn(
+                _, probs_i = chunked_query_self_attn(
                     q_i,
                     k_i,
                     v_i,
@@ -400,6 +400,8 @@ def llama_standard_attn_backward(
                     dropout_p=dropout_p,
                     key_padding_mask=gathered_key_padding_mask,
                 )
+            else:
+                probs_i = probs[:, head_slice]  # probs [B H Sq Sk]
 
 
             chunked_query_self_attn_backward(
@@ -408,7 +410,7 @@ def llama_standard_attn_backward(
                 k=k_i,
                 v=v_i,
                 # out=out_i,
-                probs=probs[:, head_slice],  # probs [B H Sq Sk]
+                probs=probs_i,
                 dq=dq_i,
                 dk=dk_i,
                 dv=dv_i,
@@ -419,7 +421,9 @@ def llama_standard_attn_backward(
                 causal=causal,  # TODO: To implement
             )
             dkv_buffer = rearrange(
-                [dk_i, dv_i], 'two b hs (w sk) dh -> two w b hs sk dh', two=2, w=world_size
+                [dk_i, dv_i],
+                'two b hs (w sk) dh -> two w b hs sk dh',
+                two=2, w=world_size
             )
             # dkv_buffer[0] = rearrange(dk_i, 'b hs (w sk) dh -> w b hs sk dh', w=world_size)
             # dkv_buffer[1] = rearrange(dv_i, 'b hs (w sk) dh -> w b hs sk dh', w=world_size)
@@ -526,12 +530,10 @@ def chunked_query_self_attn_backward(
         dp_c_before_dropout = dp_c_after_dropout
         if dropout_p > 0.0:  # TODO: dropout is untested
             # Regenerate dropout mask. Uses global PyTorch RNG.
-            # For bitwise reproducibility with FlashAttention, specific RNG (Philox) and seed management would be needed.
-            # This approach is similar to PyTorch's internal _scaled_dot_product_attention backward.
-            dropout_mask = torch.empty_like(probs_c, dtype=torch.bool).bernoulli_(1.0 - dropout_p)
-            dropout_mask_float = dropout_mask.type_as(dp_c_after_dropout)
-            # dL/dP = (dL/dP_dropped) * M / (1-p)
-            dp_c_before_dropout = dp_c_after_dropout.mul(dropout_mask_float).mul_(1.0 / (1.0 - dropout_p))
+            raise NotImplementedError(
+                "Dropout in backward is not implemented yet. "
+                "Please set dropout_p=0.0 for now."
+            )
 
         # Grad w.r.t. S (attention scores): dS = P * (dP_before_dropout - sum(P * dP_before_dropout))
         # ds_c shape: (B, H, S_q_chunk, S_k_total)
