@@ -47,8 +47,10 @@ class LlamaStandardAttn(torch.autograd.Function):
         # logging.debug(f"out {out[0,:2,3,:4]} out {softmax_lse[0,:2,:5]}")     
         # this should be out_padded
         if recompute_bwd:
-            probs = None
-        ctx.save_for_backward(q, k, v, probs)  # don't need out
+            ctx.save_for_backward(q, k, v, None)  # don't need out
+        else:
+            ctx.save_for_backward(q, k, v, probs)  # don't need out
+
         ctx.key_padding_mask = key_padding_mask
 
         ctx.dropout_p = dropout_p
