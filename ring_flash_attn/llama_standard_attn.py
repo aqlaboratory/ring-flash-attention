@@ -28,8 +28,9 @@ class LlamaStandardAttn(torch.autograd.Function):
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
 
-        k = k.contiguous()
-        v = v.contiguous()
+        k = k.contiguous().float()
+        v = v.contiguous().float()
+        q = q.float()
         out, probs = llama_standard_attn_forward(
             q,
             k,
@@ -381,15 +382,15 @@ def llama_standard_attn_backward(
 
             # kv_buffer[0] has shape (world_size, batch_k, heads_k_stride, seq_k, head_dim)
             # We want k_i to be (batch_k, heads_k_stride, world_size * seq_k, head_dim)
-            k_i, v_i = rearrange(
-                kv_buffer, 'two w b hs sk dh -> two b hs (w sk) dh', two=2)
-            dk_i, dv_i = rearrange(
-                dkv_buffer, 'two w b hs sk dh -> two b hs (w sk) dh', two=2)
+            # k_i, v_i = rearrange(
+            #     kv_buffer, 'two w b hs sk dh -> two b hs (w sk) dh', two=2)
+            # dk_i, dv_i = rearrange(
+            #     dkv_buffer, 'two w b hs sk dh -> two b hs (w sk) dh', two=2)
             #  it's a copy
-            # k_i = rearrange(kv_buffer[0], 'w b hs sk dh -> b hs (w sk) dh')
-            # v_i = rearrange(kv_buffer[1], 'w b hs sk dh -> b hs (w sk) dh')
-            # dk_i = rearrange(dkv_buffer[0], 'w b hs sk dh -> b hs (w sk) dh')
-            # dv_i = rearrange(dkv_buffer[1], 'w b hs sk dh -> b hs (w sk) dh')
+            k_i = rearrange(kv_buffer[0], 'w b hs sk dh -> b hs (w sk) dh')
+            v_i = rearrange(kv_buffer[1], 'w b hs sk dh -> b hs (w sk) dh')
+            dk_i = rearrange(dkv_buffer[0], 'w b hs sk dh -> b hs (w sk) dh')
+            dv_i = rearrange(dkv_buffer[1], 'w b hs sk dh -> b hs (w sk) dh')
             if recompute_bwd:
                 _, probs_i = chunked_query_self_attn(
                     q_i,
@@ -420,28 +421,28 @@ def llama_standard_attn_backward(
                 key_padding_mask=gathered_key_padding_mask,
                 causal=causal,  # TODO: To implement
             )
-            dkv_buffer = rearrange(
-                [dk_i, dv_i],
-                'two b hs (w sk) dh -> two w b hs sk dh',
-                two=2, w=world_size
-            )
-            # dkv_buffer[0] = rearrange(dk_i, 'b hs (w sk) dh -> w b hs sk dh', w=world_size)
-            # dkv_buffer[1] = rearrange(dv_i, 'b hs (w sk) dh -> w b hs sk dh', w=world_size)
+            # dkv_buffer = rearrange(
+            #     [dk_i, dv_i],
+            #     'two b hs (w sk) dh -> two w b hs sk dh',
+            #     two=2, w=world_size
+            # )
+            dkv_buffer[0] = rearrange(dk_i, 'b hs (w sk) dh -> w b hs sk dh', w=world_size)
+            dkv_buffer[1] = rearrange(dv_i, 'b hs (w sk) dh -> w b hs sk dh', w=world_size)
             if heads_k_stride != nheads_k:
                 # reduce_scatter needs contiguous buffer
                 # dk_i dv_i is not a pointer to kv_buffer[0] and kv_buffer[1]
-                dk_i = kv_contiguous_buffer[0]
-                dv_i = kv_contiguous_buffer[1]
+                dk_i = kv_contiguous_buffer[0].float()
+                dv_i = kv_contiguous_buffer[1].float()
             else:
-                dk_i = dk
-                dv_i = dv
+                dk_i = dk.float()
+                dv_i = dv.float()
 
-            dist.reduce_scatter_tensor(dk_i, dkv_buffer[0], group=process_group)
-            dist.reduce_scatter_tensor(dv_i, dkv_buffer[1], group=process_group)
+            dist.reduce_scatter_tensor(dk_i, dkv_buffer[0].float(), group=process_group)
+            dist.reduce_scatter_tensor(dv_i, dkv_buffer[1].float(), group=process_group)
 
             if heads_k_stride != nheads_k:  # b h s d
-                dk[:, i : i + heads_k_stride] = dk_i
-                dv[:, i : i + heads_k_stride] = dv_i
+                dk[:, i : i + heads_k_stride] = dk_i.type_as(q)
+                dv[:, i : i + heads_k_stride] = dv_i.type_as(q)
     else: # Single process, no communication needed
         #dq.zero_()
         dk.zero_()

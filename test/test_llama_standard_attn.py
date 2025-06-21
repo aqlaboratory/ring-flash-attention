@@ -245,28 +245,28 @@ class TestAttention(unittest.TestCase):
             # Forward output comparison
             with self.subTest(msg=f"Forward output comparison (use_mask={use_mask})"):
                 self.assertTrue(
-                    torch.allclose(pytorch_output_bhsd, output, atol=1e-4, rtol=1e-4),
+                    torch.allclose(pytorch_output_bhsd, output, atol=1e-6, rtol=1e-5),
                     f"Forward output mismatch. PyTorch: {pytorch_output_bhsd[0,:2,3,:4]}, Custom: {output[0,:2,3,:4]}"
                 )
             
             # Gradient comparison for dQ
             with self.subTest(msg=f"dQ gradient comparison (use_mask={use_mask})"):
                 self.assertTrue(
-                    torch.allclose(expected_dq, dq, atol=1e-3, rtol=1e-4),
+                    torch.allclose(expected_dq, dq, atol=1e-6, rtol=1e-5),
                     f"dQ gradient mismatch. Expected: {expected_dq[0,-2:,3,:4]}, Actual: {dq[0,-2:,3,:4]}"
                 )
 
             # Gradient comparison for dK
             with self.subTest(msg=f"dK gradient comparison (use_mask={use_mask})"):
                 self.assertTrue(
-                    torch.allclose(expected_dk, dk, atol=1e-3, rtol=1e-4),
+                    torch.allclose(expected_dk, dk, atol=1e-6, rtol=1e-5),
                     f"dK gradient mismatch. Expected max abs: {expected_dk.abs().max()}, Actual max abs: {dk.abs().max()}"
                 )
 
             # Gradient comparison for dV
             with self.subTest(msg=f"dV gradient comparison (use_mask={use_mask})"):
                 self.assertTrue(
-                    torch.allclose(expected_dv, dv, atol=1e-3, rtol=1e-4),
+                    torch.allclose(expected_dv, dv, atol=1e-6, rtol=1e-5),
                     f"dV gradient mismatch. Expected max abs: {expected_dv.abs().max()}, Actual max abs: {dv.abs().max()}"
                 )
 
