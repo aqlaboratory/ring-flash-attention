@@ -38,3 +38,6 @@ from .adapters import (
     substitute_hf_flash_attn,
     update_ring_flash_attn_params,
 )
+from .llama_standard_attn import (
+    llama_standard_attn_func,
+)
