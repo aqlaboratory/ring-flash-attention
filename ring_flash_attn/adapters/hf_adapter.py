@@ -8,12 +8,14 @@ import transformers
 import transformers.modeling_flash_attention_utils
 try:
     from transformers.modeling_flash_attention_utils import (
-        is_flash_attn_greater_or_equal_2_10,
+        _flash_supports_window,
+        is_flash_attn_greater_or_equal,
     )
 except ImportError:
     # transformers <= 4.53.x
     from transformers.modeling_flash_attention_utils import (
-        is_flash_attn_greater_or_equal_2_10,
+        _flash_supports_window_size as _flash_supports_window,
+        is_flash_attn_greater_or_equal,
     )
 
 from ..llama3_flash_attn_varlen import (
@@ -117,7 +119,8 @@ def create_ring_flash_attention_forward(
 
         # Assuming 4D tensors, key_states.shape[1] is the key/value sequence length (source length).
         use_sliding_windows = (
-            sliding_window is not None
+            _flash_supports_window
+            and sliding_window is not None
             and key_states.shape[1] > sliding_window
         )
         flash_kwargs = (
@@ -126,7 +129,7 @@ def create_ring_flash_attention_forward(
             else {}
         )
 
-        if is_flash_attn_greater_or_equal_2_10:
+        if is_flash_attn_greater_or_equal("2.4.1"):
             if deterministic is None:
                 deterministic = (
                     os.environ.get("FLASH_ATTENTION_DETERMINISTIC", "0") == "1"
