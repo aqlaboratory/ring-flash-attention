@@ -6,10 +6,16 @@ import torch
 import torch.distributed as dist
 import transformers
 import transformers.modeling_flash_attention_utils
-from transformers.modeling_flash_attention_utils import (
-    _flash_supports_window_size,
-    is_flash_attn_greater_or_equal,
-)
+try:
+    from transformers.modeling_flash_attention_utils import (
+        is_flash_attn_greater_or_equal_2_10,
+    )
+except ImportError:
+    # transformers <= 4.53.x
+    from transformers.modeling_flash_attention_utils import (
+        is_flash_attn_greater_or_equal_2_10,
+    )
+
 from ..llama3_flash_attn_varlen import (
     llama3_flash_attn_varlen_func,
     llama3_flash_attn_prepare_cu_seqlens,
@@ -111,8 +117,7 @@ def create_ring_flash_attention_forward(
 
         # Assuming 4D tensors, key_states.shape[1] is the key/value sequence length (source length).
         use_sliding_windows = (
-            _flash_supports_window_size
-            and sliding_window is not None
+            sliding_window is not None
             and key_states.shape[1] > sliding_window
         )
         flash_kwargs = (
@@ -121,7 +126,7 @@ def create_ring_flash_attention_forward(
             else {}
         )
 
-        if is_flash_attn_greater_or_equal("2.4.1"):
+        if is_flash_attn_greater_or_equal_2_10:
             if deterministic is None:
                 deterministic = (
                     os.environ.get("FLASH_ATTENTION_DETERMINISTIC", "0") == "1"
@@ -232,10 +237,50 @@ def create_ring_flash_attention_forward(
             deterministic,
         )
 
+    # transformers 4.53.0+
+    def _flash_attention_forward_v3(
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        query_length: int,
+        is_causal: bool,
+        dropout: float = 0.0,
+        position_ids: Optional[torch.Tensor] = None,
+        softmax_scale: Optional[float] = None,
+        sliding_window: Optional[int] = None,
+        use_top_left_mask: bool = False,
+        softcap: Optional[float] = None,
+        deterministic: bool = None,
+        cu_seq_lens_q: Optional[torch.LongTensor] = None,
+        cu_seq_lens_k: Optional[torch.LongTensor] = None,
+        max_length_q: Optional[int] = None,
+        max_length_k: Optional[int] = None,
+        target_dtype: Optional[torch.dtype] = None,
+        attn_implementation: Optional[str] = None,
+        **kwargs,
+    ):
+        return _flash_attention_forward(
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            query_length,
+            is_causal,
+            dropout,
+            position_ids,
+            softmax_scale,
+            sliding_window,
+            use_top_left_mask,
+            softcap,
+            deterministic,
+        )
+
     return [
         _flash_attention_forward,
         _flash_attention_forward_v1,
         _flash_attention_forward_v2,
+        _flash_attention_forward_v3,
     ]
 
 
