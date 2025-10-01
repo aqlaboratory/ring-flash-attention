@@ -55,6 +55,8 @@ def llama_flash_attn_forward(
 
     k_0 = k[:, :, :heads_k_stride].contiguous()
     v_0 = v[:, :, :heads_k_stride].contiguous()
+    if causal:
+        local_rank = dist.get_rank(process_group)
 
     comm = Comm(process_group)
     # Pass the main tensor slices to all_gather
@@ -79,12 +81,18 @@ def llama_flash_attn_forward(
             comm.all_gather(kv_buffer_copy[0], send_k)
             comm.all_gather(kv_buffer_copy[1], send_v)
 
+
         q_i = q[:, :, i * nheads // nheads_k : (i + heads_k_stride) * nheads // nheads_k]
         # kv_buffer[0] has shape (batch_k, seq_k, world_size, heads_k_stride, head_dim)
         # We want k_i to be (batch_k, seq_k * world_size, heads_k_stride, head_dim)
-        k_i = rearrange(kv_buffer[0], 'w b s hs dh -> b (w s) hs dh')
-        v_i = rearrange(kv_buffer[1], 'w b s hs dh -> b (w s) hs dh')
-
+        if causal:
+            k_i = kv_buffer[0][:(local_rank + 1), :, :, :, :].contiguous()
+            v_i = kv_buffer[1][:(local_rank + 1), :, :, :, :].contiguous()
+            k_i = rearrange(k_i, 'w b s hs dh -> b (w s) hs dh')
+            v_i = rearrange(v_i, 'w b s hs dh -> b (w s) hs dh')
+        else:
+            k_i = rearrange(kv_buffer[0], 'w b s hs dh -> b (w s) hs dh')
+            v_i = rearrange(kv_buffer[1], 'w b s hs dh -> b (w s) hs dh')
 
         # params = get_default_args(_flash_attn_varlen_forward).copy()
         params = {
@@ -138,6 +146,7 @@ def llama_flash_attn_backward(
     alibi_slopes=None,
     deterministic=False,
 ):
+    raise NotImplementedError("Backward pass is broken")
     nheads = q.shape[2]
     batch_k, seq_k, nheads_k, head_dim = k.shape
     assert nheads_k % heads_k_stride == 0
@@ -455,6 +464,7 @@ def llama_flash_attn_func(
     deterministic=False,
     return_attn_probs=False,
     group=None,
+    bwd_event_sync=False,
 ):
     # logging.debug(f"q {q[0,:2,3,:4]}")
     return LlamaFlashAttnFunc.apply(
