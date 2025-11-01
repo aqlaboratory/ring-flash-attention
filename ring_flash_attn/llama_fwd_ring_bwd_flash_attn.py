@@ -121,7 +121,7 @@ def llama_flash_attn_forward(
 
             if head_first_stride is not None and step == 0:
                 # For the second step, gather into a slice of the main buffer
-                next_buffer = kv_buffer_copy[:, :, :, :, :next_stride, :]
+                next_buffer = kv_buffer_copy[:, :, :, :, :next_stride, :].contiguous()
             else:
                 next_buffer = kv_buffer_copy
 
@@ -396,7 +396,7 @@ class LlamaRingFlashAttnFunc(torch.autograd.Function):
         if ctx.bwd_event_sync:
             time_event.synchronize()
         # return dq, dk, dv, None, None, None, None, None, None, None, None
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None
 
 class LlamaFlashAttnFunc(torch.autograd.Function):
     @staticmethod
