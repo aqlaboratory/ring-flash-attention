@@ -33,6 +33,7 @@ def llama_flash_attn_forward(
     softcap=0.0,
     alibi_slopes=None,
     deterministic=False,
+    head_first_stride=None,
     time_event=None,  # Sync GPU,CPU to lower vRAM allocation; no sync by default
 ):
     out_list = []
@@ -46,6 +47,7 @@ def llama_flash_attn_forward(
 
     world_size = dist.get_world_size(process_group)
 
+    # Main buffers for standard stride operations
     kv_buffer = torch.empty(
         (2, world_size, batch_k, seq_k, heads_k_stride, head_dim),
         dtype=k.dtype,
@@ -53,46 +55,92 @@ def llama_flash_attn_forward(
     )
     kv_buffer_copy = torch.empty_like(kv_buffer)
 
-    k_0 = k[:, :, :heads_k_stride].contiguous()
-    v_0 = v[:, :, :heads_k_stride].contiguous()
     if causal:
         local_rank = dist.get_rank(process_group)
 
+    if head_first_stride is not None:
+        assert 0 < head_first_stride < heads_k_stride, (
+            "head_first_stride must be between 0 and heads_k_stride"
+        )
+        stride_pattern = [
+            head_first_stride,
+            heads_k_stride - head_first_stride,
+        ] + [heads_k_stride] * ((nheads_k - heads_k_stride) // heads_k_stride)
+        k_0 = k[:, :, :head_first_stride].contiguous()
+        v_0 = v[:, :, :head_first_stride].contiguous()
+
+        # Allocate one smaller buffer for the first step
+        kv_buffer_small1 = torch.empty(
+            (2, world_size, batch_k, seq_k, head_first_stride, head_dim),
+            dtype=k.dtype, device=k.device
+        )
+        initial_kv_buffer = kv_buffer_small1
+    else:
+        # When head_first_stride is None, it behaves as before
+        stride_pattern = [heads_k_stride] * (nheads_k // heads_k_stride)
+        k_0 = k[:, :, :heads_k_stride].contiguous()
+        v_0 = v[:, :, :heads_k_stride].contiguous()
+        initial_kv_buffer = kv_buffer_copy
+
     comm = Comm(process_group)
     # Pass the main tensor slices to all_gather
-    comm.all_gather(kv_buffer_copy[0], k_0)
-    comm.all_gather(kv_buffer_copy[1], v_0)
+    comm.all_gather(initial_kv_buffer[0], k_0)
+    comm.all_gather(initial_kv_buffer[1], v_0)
 
-    for i in range(0, nheads_k, heads_k_stride):
+    current_head = 0
+    for step, stride in enumerate(stride_pattern):
+        i = current_head
+        current_head += stride
+
         # Optimization: No sync on last head stride
-        if (i == nheads_k - heads_k_stride) and (time_event is not None):
+        if (step == len(stride_pattern) - 1) and (time_event is not None):
             time_event.record()
         comm.wait()
-        # Swap the main storage tensors
-        kv_buffer, kv_buffer_copy = kv_buffer_copy, kv_buffer
 
-        if i < nheads_k - heads_k_stride:
+        if head_first_stride is not None:
+            if step == 0:
+                current_kv_buffer = kv_buffer_small1
+            elif step == 1:
+                # Use a slice of the main buffer for the second step
+                current_kv_buffer = kv_buffer_copy[:, :, :, :, :stride, :]
+            else:
+                kv_buffer, kv_buffer_copy = kv_buffer_copy, kv_buffer
+                current_kv_buffer = kv_buffer
+        else:
+            # Original behavior: swap the main storage tensors
+            kv_buffer, kv_buffer_copy = kv_buffer_copy, kv_buffer
+            current_kv_buffer = kv_buffer
+
+        if step < len(stride_pattern) - 1:
             # all_gather the next kv slice
-            kv_slice_left = i + heads_k_stride
-            kv_slice_right = kv_slice_left + heads_k_stride
-            send_k = k[:,:,  kv_slice_left:kv_slice_right].contiguous()
-            send_v = v[:,:,  kv_slice_left:kv_slice_right].contiguous()
+            kv_slice_left = current_head
+            next_stride = stride_pattern[step + 1]
+            kv_slice_right = current_head + next_stride
+            send_k = k[:, :, kv_slice_left:kv_slice_right].contiguous()
+            send_v = v[:, :, kv_slice_left:kv_slice_right].contiguous()
+
+            if head_first_stride is not None and step == 0:
+                # For the second step, gather into a slice of the main buffer
+                next_buffer = kv_buffer_copy[:, :, :, :, :next_stride, :]
+            else:
+                next_buffer = kv_buffer_copy
+
             # Pass the main tensor slices for the next round
-            comm.all_gather(kv_buffer_copy[0], send_k)
-            comm.all_gather(kv_buffer_copy[1], send_v)
+            comm.all_gather(next_buffer[0], send_k)
+            comm.all_gather(next_buffer[1], send_v)
 
 
-        q_i = q[:, :, i * nheads // nheads_k : (i + heads_k_stride) * nheads // nheads_k]
+        q_i = q[:, :, i * nheads // nheads_k : current_head * nheads // nheads_k]
         # kv_buffer[0] has shape (batch_k, seq_k, world_size, heads_k_stride, head_dim)
         # We want k_i to be (batch_k, seq_k * world_size, heads_k_stride, head_dim)
         if causal:
-            k_i = kv_buffer[0][:(local_rank + 1), :, :, :, :].contiguous()
-            v_i = kv_buffer[1][:(local_rank + 1), :, :, :, :].contiguous()
+            k_i = current_kv_buffer[0][:(local_rank + 1), :, :, :, :].contiguous()
+            v_i = current_kv_buffer[1][:(local_rank + 1), :, :, :, :].contiguous()
             k_i = rearrange(k_i, 'w b s hs dh -> b (w s) hs dh')
             v_i = rearrange(v_i, 'w b s hs dh -> b (w s) hs dh')
         else:
-            k_i = rearrange(kv_buffer[0], 'w b s hs dh -> b (w s) hs dh')
-            v_i = rearrange(kv_buffer[1], 'w b s hs dh -> b (w s) hs dh')
+            k_i = rearrange(current_kv_buffer[0], "w b s hs dh -> b (w s) hs dh")
+            v_i = rearrange(current_kv_buffer[1], "w b s hs dh -> b (w s) hs dh")
 
         # params = get_default_args(_flash_attn_varlen_forward).copy()
         params = {
