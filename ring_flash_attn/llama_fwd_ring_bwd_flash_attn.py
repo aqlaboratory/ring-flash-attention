@@ -74,6 +74,12 @@ def llama_flash_attn_forward(
             (2, world_size, batch_k, seq_k, head_first_stride, head_dim),
             dtype=k.dtype, device=k.device
         )
+        # Allocate a second buffer for the second, non-standard step
+        kv_buffer_small2 = torch.empty(
+            (2, world_size, batch_k, seq_k, heads_k_stride - head_first_stride, head_dim),
+            dtype=k.dtype, device=k.device
+        )
+        initial_kv_buffer = kv_buffer_small1
         initial_kv_buffer = kv_buffer_small1
     else:
         # When head_first_stride is None, it behaves as before
@@ -99,11 +105,16 @@ def llama_flash_attn_forward(
 
         if head_first_stride is not None:
             if step == 0:
+                # Read from the first small buffer
                 current_kv_buffer = kv_buffer_small1
             elif step == 1:
-                # Use a slice of the main buffer for the second step
-                current_kv_buffer = kv_buffer_copy[:, :, :, :, :stride, :]
+                # Read from the second small buffer
+                current_kv_buffer = kv_buffer_small2
+            elif step == 2:
+                # This is the first "full" buffer. Data was gathered into kv_buffer.
+                current_kv_buffer = kv_buffer
             else:
+                # From step 3 onwards, the normal double-buffer swap applies
                 kv_buffer, kv_buffer_copy = kv_buffer_copy, kv_buffer
                 current_kv_buffer = kv_buffer
         else:
@@ -119,10 +130,18 @@ def llama_flash_attn_forward(
             send_k = k[:, :, kv_slice_left:kv_slice_right].contiguous()
             send_v = v[:, :, kv_slice_left:kv_slice_right].contiguous()
 
-            if head_first_stride is not None and step == 0:
-                # For the second step, gather into a slice of the main buffer
-                next_buffer = kv_buffer_copy[:, :, :, :, :next_stride, :].contiguous()
+            if head_first_stride is not None:
+                if step == 0:
+                    # Step 0: Gather chunk 1 into kv_buffer_small2
+                    next_buffer = kv_buffer_small2
+                elif step == 1:
+                    # Step 1: Gather chunk 2 into kv_buffer
+                    next_buffer = kv_buffer
+                else:
+                    # Step 2+: Gather into kv_buffer_copy (normal swap pattern)
+                    next_buffer = kv_buffer_copy
             else:
+                # Original behavior
                 next_buffer = kv_buffer_copy
 
             # Pass the main tensor slices for the next round
