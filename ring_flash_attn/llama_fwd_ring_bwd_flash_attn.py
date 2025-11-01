@@ -475,6 +475,7 @@ def llama_fwd_ring_bwd_flash_attn_func(
     k,
     v,
     heads_k_stride=1,  # default 1 always works, but need optimize
+    head_first_stride=None,
     dropout_p=0.0,
     softmax_scale=None,
     causal=False,
@@ -490,6 +491,7 @@ def llama_fwd_ring_bwd_flash_attn_func(
         k,
         v,
         heads_k_stride,
+        head_first_stride,
         dropout_p,
         softmax_scale,
         causal,
