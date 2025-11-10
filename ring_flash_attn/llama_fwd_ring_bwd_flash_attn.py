@@ -99,8 +99,8 @@ def llama_flash_attn_forward(
         current_head += stride
 
         # Optimization: No sync on last head stride
-        if (step == len(stride_pattern) - 1) and (time_event is not None):
-            time_event.record()
+        # if (step == len(stride_pattern) - 1) and (time_event is not None):
+        #     time_event.record()
         comm.wait()
 
         if head_first_stride is not None:
@@ -353,6 +353,8 @@ class LlamaRingFlashAttnFunc(torch.autograd.Function):
         group,
         bwd_event_sync,
     ):
+        # Seems FSDP caching allocation has been imporved, so no need to sync here
+        # Increase in memory is minimal, reinstate later if needed
         # time_event = torch.cuda.Event(enable_timing=False)
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
@@ -392,8 +394,8 @@ class LlamaRingFlashAttnFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dout, *args):
         time_event = None
-        if ctx.bwd_event_sync:
-            time_event = torch.cuda.Event(enable_timing=False)
+        # if ctx.bwd_event_sync:
+        #     time_event = torch.cuda.Event(enable_timing=False)
         q, k, v, out, softmax_lse = ctx.saved_tensors
         dq, dk, dv = ring_flash_attn_backward(
             ctx.group,
@@ -412,8 +414,8 @@ class LlamaRingFlashAttnFunc(torch.autograd.Function):
             deterministic=ctx.deterministic,
             time_event=time_event,
         )
-        if ctx.bwd_event_sync:
-            time_event.synchronize()
+        # if ctx.bwd_event_sync:
+        #     time_event.synchronize()
         # return dq, dk, dv, None, None, None, None, None, None, None, None
         return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None
 
