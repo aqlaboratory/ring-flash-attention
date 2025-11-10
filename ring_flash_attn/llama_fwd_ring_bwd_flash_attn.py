@@ -353,7 +353,7 @@ class LlamaRingFlashAttnFunc(torch.autograd.Function):
         group,
         bwd_event_sync,
     ):
-        time_event = torch.cuda.Event(enable_timing=False)
+        # time_event = torch.cuda.Event(enable_timing=False)
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
 
@@ -373,9 +373,9 @@ class LlamaRingFlashAttnFunc(torch.autograd.Function):
             window_size=window_size,
             alibi_slopes=alibi_slopes,
             deterministic=False,
-            time_event=time_event,
+            # time_event=time_event,
         )
-        time_event.synchronize()
+        # time_event.synchronize()
         # logging.debug(f"out {out[0,:2,3,:4]} out {softmax_lse[0,:2,:5]}")     
         # this should be out_padded
         ctx.save_for_backward(q, k, v, out, softmax_lse)
