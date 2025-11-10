@@ -353,8 +353,7 @@ class LlamaRingFlashAttnFunc(torch.autograd.Function):
         group,
         bwd_event_sync,
     ):
-        # Seems FSDP caching allocation has been imporved, so no need to sync here
-        # Increase in memory is minimal, reinstate later if needed
+        # Let ESM3s handle forward syncing for efficiency
         # time_event = torch.cuda.Event(enable_timing=False)
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
