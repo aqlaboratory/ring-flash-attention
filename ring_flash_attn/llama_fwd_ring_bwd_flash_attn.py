@@ -107,7 +107,6 @@ def llama_flash_attn_forward(
             dtype=k.dtype, device=k.device
         )
         initial_kv_buffer = kv_buffer_small1
-        initial_kv_buffer = kv_buffer_small1
     else:
         # When head_first_stride is None, it behaves as before
         stride_pattern = [heads_k_stride] * (nheads_k // heads_k_stride)
