@@ -3,6 +3,7 @@ import torch.distributed as dist
 from flash_attn.flash_attn_interface import _flash_attn_forward, _flash_attn_backward
 from .ring_flash_attn import ring_flash_attn_backward
 from einops import rearrange
+from typing import Optional, Tuple
 from .utils import get_default_args, AllGatherComm as Comm
 import logging
 import torch.distributed._tensor as distp_tensor
@@ -20,21 +21,48 @@ else:
     _wrapped_flash_attn_backward = _flash_attn_backward
 
 def llama_flash_attn_forward(
-    process_group,
+    process_group: dist.ProcessGroup,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    heads_k_stride,
-    # local_k_slice,  # k slice is only meant for var_len (q_local only attend to k_slice)
-    softmax_scale,
-    dropout_p=0,
-    causal=True,
-    window_size=(-1, -1),
-    softcap=0.0,
-    alibi_slopes=None,
-    deterministic=False,
-    time_event=None,  # Sync GPU,CPU to lower vRAM allocation; no sync by default
-):
+    heads_k_stride: int,
+    head_first_stride: Optional[int] = None,
+    softmax_scale: float,
+    dropout_p: float = 0.0,
+    causal: bool = True,
+    window_size: Tuple[int, int] = (-1, -1),
+    softcap: float = 0.0,
+    alibi_slopes: Optional[torch.Tensor] = None,
+    deterministic: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Llama-style flash attention forward pass with ring communication.
+
+    This function performs the forward pass of attention, distributing the key and value tensors
+    across a process group using all-gather operations. It supports grouped-query attention (GQA)
+    and multi-query attention (MQA) by processing heads in strides.
+
+    Args:
+        process_group (dist.ProcessGroup): The distributed process group for communication.
+        q (torch.Tensor): Query tensor of shape `(batch_size, seq_len, num_heads, head_dim)`.
+        k (torch.Tensor): Key tensor of shape `(batch_size, seq_len, num_kv_heads, head_dim)`.
+        v (torch.Tensor): Value tensor of shape `(batch_size, seq_len, num_kv_heads, head_dim)`.
+        heads_k_stride (int): The number of key/value heads to process in each communication step.
+        head_first_stride (Optional[int], optional): A different (smaller) stride for the first group of heads.
+            This is an optimization to increase communication/computation overlap. Defaults to None.
+        softmax_scale (float): The scale factor for softmax.
+        dropout_p (float, optional): Dropout probability. Defaults to 0.0.
+        causal (bool, optional): Whether to apply causal masking. Defaults to True.
+        window_size (Tuple[int, int], optional): Sliding window size for attention. Defaults to (-1, -1).
+        softcap (float, optional): Softcap for attention scores. Defaults to 0.0.
+        alibi_slopes (Optional[torch.Tensor], optional): ALiBi slopes for positional bias. Defaults to None.
+        deterministic (bool, optional): Whether to use deterministic algorithms. Defaults to False.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
+            - out (torch.Tensor): The attention output tensor.
+            - lse (torch.Tensor): The log-sum-exp of the attention scores for the backward pass.
+    """
     out_list = []
     lse_list = []
     # logging.debug(f"bwd q {q[0,:2,0,:3]}")     
@@ -46,6 +74,7 @@ def llama_flash_attn_forward(
 
     world_size = dist.get_world_size(process_group)
 
+    # Main buffers for standard stride operations
     kv_buffer = torch.empty(
         (2, world_size, batch_k, seq_k, heads_k_stride, head_dim),
         dtype=k.dtype,
@@ -53,46 +82,107 @@ def llama_flash_attn_forward(
     )
     kv_buffer_copy = torch.empty_like(kv_buffer)
 
-    k_0 = k[:, :, :heads_k_stride].contiguous()
-    v_0 = v[:, :, :heads_k_stride].contiguous()
     if causal:
         local_rank = dist.get_rank(process_group)
 
+    if head_first_stride is not None:
+        assert 0 < head_first_stride < heads_k_stride, (
+            "head_first_stride must be between 0 and heads_k_stride"
+        )
+        stride_pattern = [
+            head_first_stride,
+            heads_k_stride - head_first_stride,
+        ] + [heads_k_stride] * ((nheads_k - heads_k_stride) // heads_k_stride)
+        k_0 = k[:, :, :head_first_stride].contiguous()
+        v_0 = v[:, :, :head_first_stride].contiguous()
+
+        # Allocate one smaller buffer for the first step
+        kv_buffer_small1 = torch.empty(
+            (2, world_size, batch_k, seq_k, head_first_stride, head_dim),
+            dtype=k.dtype, device=k.device
+        )
+        # Allocate a second buffer for the second, non-standard step
+        kv_buffer_small2 = torch.empty(
+            (2, world_size, batch_k, seq_k, heads_k_stride - head_first_stride, head_dim),
+            dtype=k.dtype, device=k.device
+        )
+        initial_kv_buffer = kv_buffer_small1
+    else:
+        # When head_first_stride is None, it behaves as before
+        stride_pattern = [heads_k_stride] * (nheads_k // heads_k_stride)
+        k_0 = k[:, :, :heads_k_stride].contiguous()
+        v_0 = v[:, :, :heads_k_stride].contiguous()
+        initial_kv_buffer = kv_buffer_copy
+
     comm = Comm(process_group)
     # Pass the main tensor slices to all_gather
-    comm.all_gather(kv_buffer_copy[0], k_0)
-    comm.all_gather(kv_buffer_copy[1], v_0)
+    comm.all_gather(initial_kv_buffer[0], k_0)
+    comm.all_gather(initial_kv_buffer[1], v_0)
 
-    for i in range(0, nheads_k, heads_k_stride):
-        # Optimization: No sync on last head stride
-        if (i == nheads_k - heads_k_stride) and (time_event is not None):
-            time_event.record()
+    current_head = 0
+    for step, stride in enumerate(stride_pattern):
+        i = current_head
+        current_head += stride
+
         comm.wait()
-        # Swap the main storage tensors
-        kv_buffer, kv_buffer_copy = kv_buffer_copy, kv_buffer
 
-        if i < nheads_k - heads_k_stride:
+        if head_first_stride is not None:
+            if step == 0:
+                # Read from the first small buffer
+                current_kv_buffer = kv_buffer_small1
+            elif step == 1:
+                # Read from the second small buffer
+                current_kv_buffer = kv_buffer_small2
+            elif step == 2:
+                # This is the first "full" buffer. Data was gathered into kv_buffer.
+                current_kv_buffer = kv_buffer
+            else:
+                # From step 3 onwards, the normal double-buffer swap applies
+                kv_buffer, kv_buffer_copy = kv_buffer_copy, kv_buffer
+                current_kv_buffer = kv_buffer
+        else:
+            # Original behavior: swap the main storage tensors
+            kv_buffer, kv_buffer_copy = kv_buffer_copy, kv_buffer
+            current_kv_buffer = kv_buffer
+
+        if step < len(stride_pattern) - 1:
             # all_gather the next kv slice
-            kv_slice_left = i + heads_k_stride
-            kv_slice_right = kv_slice_left + heads_k_stride
-            send_k = k[:,:,  kv_slice_left:kv_slice_right].contiguous()
-            send_v = v[:,:,  kv_slice_left:kv_slice_right].contiguous()
+            kv_slice_left = current_head
+            next_stride = stride_pattern[step + 1]
+            kv_slice_right = current_head + next_stride
+            send_k = k[:, :, kv_slice_left:kv_slice_right].contiguous()
+            send_v = v[:, :, kv_slice_left:kv_slice_right].contiguous()
+
+            if head_first_stride is not None:
+                if step == 0:
+                    # Step 0: Gather chunk 1 into kv_buffer_small2
+                    next_buffer = kv_buffer_small2
+                elif step == 1:
+                    # Step 1: Gather chunk 2 into kv_buffer
+                    next_buffer = kv_buffer
+                else:
+                    # Step 2+: Gather into kv_buffer_copy (normal swap pattern)
+                    next_buffer = kv_buffer_copy
+            else:
+                # Original behavior
+                next_buffer = kv_buffer_copy
+
             # Pass the main tensor slices for the next round
-            comm.all_gather(kv_buffer_copy[0], send_k)
-            comm.all_gather(kv_buffer_copy[1], send_v)
+            comm.all_gather(next_buffer[0], send_k)
+            comm.all_gather(next_buffer[1], send_v)
 
 
-        q_i = q[:, :, i * nheads // nheads_k : (i + heads_k_stride) * nheads // nheads_k]
+        q_i = q[:, :, i * nheads // nheads_k : current_head * nheads // nheads_k]
         # kv_buffer[0] has shape (batch_k, seq_k, world_size, heads_k_stride, head_dim)
         # We want k_i to be (batch_k, seq_k * world_size, heads_k_stride, head_dim)
         if causal:
-            k_i = kv_buffer[0][:(local_rank + 1), :, :, :, :].contiguous()
-            v_i = kv_buffer[1][:(local_rank + 1), :, :, :, :].contiguous()
+            k_i = current_kv_buffer[0][:(local_rank + 1), :, :, :, :].contiguous()
+            v_i = current_kv_buffer[1][:(local_rank + 1), :, :, :, :].contiguous()
             k_i = rearrange(k_i, 'w b s hs dh -> b (w s) hs dh')
             v_i = rearrange(v_i, 'w b s hs dh -> b (w s) hs dh')
         else:
-            k_i = rearrange(kv_buffer[0], 'w b s hs dh -> b (w s) hs dh')
-            v_i = rearrange(kv_buffer[1], 'w b s hs dh -> b (w s) hs dh')
+            k_i = rearrange(current_kv_buffer[0], "w b s hs dh -> b (w s) hs dh")
+            v_i = rearrange(current_kv_buffer[1], "w b s hs dh -> b (w s) hs dh")
 
         # params = get_default_args(_flash_attn_varlen_forward).copy()
         params = {
@@ -267,48 +357,82 @@ def llama_flash_attn_backward(
 
 
 class LlamaRingFlashAttnFunc(torch.autograd.Function):
+    """
+    Autograd function for Llama-style ring attention.
+
+    This function implements a custom forward and backward pass for attention
+    computation that uses all-gather for keys and values in the
+    forward pass, but a standard ring-based backward pass. This is a hybrid
+    approach, where the forward pass (`llama_flash_attn_forward`) is optimized
+    for numerical stability, and the backward pass (`ring_flash_attn_backward`)
+    is a more general ring attention implementation.
+    """
     @staticmethod
     def forward(
-        ctx,
-        q,
-        k,
-        v,
-        heads_k_stride,
-        # local_k_slice,
-        dropout_p,
-        softmax_scale,
-        causal,
-        window_size,
-        alibi_slopes,
-        deterministic,
-        return_softmax,
-        group,
-        bwd_event_sync,
-    ):
-        time_event = torch.cuda.Event(enable_timing=False)
+        ctx: torch.autograd.function.FunctionCtx,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        heads_k_stride: int,
+        head_first_stride: Optional[int],
+        dropout_p: float,
+        softmax_scale: Optional[float],
+        causal: bool,
+        window_size: Tuple[int, int],
+        alibi_slopes: Optional[torch.Tensor],
+        deterministic: bool,
+        return_softmax: bool,
+        group: dist.ProcessGroup,
+        bwd_event_sync: bool,
+    ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor, None]:
+        """
+        Forward pass for Llama-style ring attention.
+        For loop in llama_flash_attn_forward could lead to early allocation of tensors
+        by the CPU, leading to memory explosion. CUDA event syncing can control this.
+        Let parent model handle forward event syncing for efficiency.
+
+        Args:
+            ctx: The context object for autograd.
+            q (torch.Tensor): Query tensor.
+            k (torch.Tensor): Key tensor.
+            v (torch.Tensor): Value tensor.
+            heads_k_stride (int): Stride for key/value heads in GQA/MQA.
+            head_first_stride (Optional[int]): A different stride for the first group of heads.
+            dropout_p (float): Dropout probability.
+            softmax_scale (Optional[float]): Scale factor for softmax. If None, calculated from head dimension.
+            causal (bool): Whether to apply causal masking.
+            window_size (Tuple[int, int]): Sliding window size.
+            alibi_slopes (Optional[torch.Tensor]): ALiBi slopes for positional bias.
+            deterministic (bool): Whether to use deterministic algorithms.
+            return_softmax (bool): Whether to return the softmax log-sum-exp.
+            group (dist.ProcessGroup): The distributed process group.
+            bwd_event_sync (bool): If True, syncs a CUDA event in the backward pass to control memory allocation.
+
+        Returns:
+            Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, None]]: The attention output, and optionally the LSE and a None placeholder.
+        """
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
 
         assert alibi_slopes is None
         k = k.contiguous()
         v = v.contiguous()
+        # out shape (batch, seq, heads, head_dim)
+        # softmax_lse shape (batch, seq, heads)
         out, softmax_lse = llama_flash_attn_forward(
             group,
             q,
             k,
             v,
             heads_k_stride=heads_k_stride,
+            head_first_stride=head_first_stride,
             softmax_scale=softmax_scale,
             dropout_p=dropout_p,
             causal=causal,
             window_size=window_size,
             alibi_slopes=alibi_slopes,
             deterministic=False,
-            time_event=time_event,
         )
-        time_event.synchronize()
-        # logging.debug(f"out {out[0,:2,3,:4]} out {softmax_lse[0,:2,:5]}")     
-        # this should be out_padded
         ctx.save_for_backward(q, k, v, out, softmax_lse)
         ctx.dropout_p = dropout_p
         ctx.softmax_scale = softmax_scale
@@ -321,7 +445,24 @@ class LlamaRingFlashAttnFunc(torch.autograd.Function):
         return out if not return_softmax else (out, softmax_lse, None)
 
     @staticmethod
-    def backward(ctx, dout, *args):
+    def backward(
+        ctx: torch.autograd.function.FunctionCtx,
+        dout: torch.Tensor,
+        *args,
+    ) -> Tuple[Optional[torch.Tensor], ...]:
+        """
+        Backward pass for Llama-style ring attention.
+
+        Uses `ring_flash_attn_backward`.
+
+        Args:
+            ctx: The context object for autograd.
+            dout (torch.Tensor): Gradient of the output.
+            *args: Other gradients.
+
+        Returns:
+            Tuple[Optional[torch.Tensor], ...]: Gradients for the inputs of the forward pass.
+        """
         time_event = None
         if ctx.bwd_event_sync:
             time_event = torch.cuda.Event(enable_timing=False)
@@ -334,7 +475,6 @@ class LlamaRingFlashAttnFunc(torch.autograd.Function):
             v,
             out,
             softmax_lse,
-            # heads_k_stride=ctx.heads_k_stride,
             softmax_scale=ctx.softmax_scale,
             dropout_p=ctx.dropout_p,
             causal=ctx.causal,
@@ -346,9 +486,12 @@ class LlamaRingFlashAttnFunc(torch.autograd.Function):
         if ctx.bwd_event_sync:
             time_event.synchronize()
         # return dq, dk, dv, None, None, None, None, None, None, None, None
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None
 
 class LlamaFlashAttnFunc(torch.autograd.Function):
+    """
+    Autograd function for Llama-style attention. NOT FINISHED
+    """
     @staticmethod
     def forward(
         ctx,
@@ -421,25 +564,63 @@ class LlamaFlashAttnFunc(torch.autograd.Function):
 
 
 def llama_fwd_ring_bwd_flash_attn_func(
-    q,
-    k,
-    v,
-    heads_k_stride=1,  # default 1 always works, but need optimize
-    dropout_p=0.0,
-    softmax_scale=None,
-    causal=False,
-    window_size=(-1, -1),
-    alibi_slopes=None,
-    deterministic=False,
-    return_attn_probs=False,
-    group=None,
-    bwd_event_sync=False,
-):
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    heads_k_stride: int = 1,
+    head_first_stride: Optional[int] = None,
+    dropout_p: float = 0.0,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    window_size: Tuple[int, int] = (-1, -1),
+    alibi_slopes: Optional[torch.Tensor] = None,
+    deterministic: bool = False,
+    return_attn_probs: bool = False,
+    group: Optional[dist.ProcessGroup] = None,
+    bwd_event_sync: bool = False,
+) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor, None]:
+    """
+    Performs Llama-style ring flash attention with a custom backward pass.
+
+    This function is a wrapper around `LlamaRingFlashAttnFunc`. It uses an
+    all-gather-based forward pass (`llama_flash_attn_forward`) which is
+    numerically stable, and a standard ring-based
+    backward pass (`ring_flash_attn_backward`).
+
+    Args:
+        q (torch.Tensor): Query tensor of shape `(batch, seq_len, n_heads, head_dim)`.
+        k (torch.Tensor): Key tensor of shape `(batch, seq_len, n_kv_heads, head_dim)`.
+        v (torch.Tensor): Value tensor of shape `(batch, seq_len, n_kv_heads, head_dim)`.
+        heads_k_stride (int, optional): The number of key/value heads to process in each
+            communication step. Defaults to 1.
+        head_first_stride (Optional[int], optional): A different stride for the first group of heads
+            to improve communication/computation overlap. Defaults to None. 
+            Must be smaller than heads_k_stride.
+        dropout_p (float, optional): Dropout probability. Defaults to 0.0.
+        softmax_scale (Optional[float], optional): The scale factor for softmax. If None, it is
+            calculated as `1.0 / sqrt(head_dim)`. Defaults to None.
+        causal (bool, optional): Whether to apply causal masking. Defaults to False.
+        window_size (Tuple[int, int], optional): Sliding window size for attention. Defaults to (-1, -1).
+        alibi_slopes (Optional[torch.Tensor], optional): ALiBi slopes for positional bias. Defaults to None.
+        deterministic (bool, optional): Whether to use deterministic algorithms. Defaults to False.
+        return_attn_probs (bool, optional): Whether to return the log-sum-exp of the attention scores.
+            If True, the output is a tuple `(out, lse, None)`. Defaults to False.
+        group (Optional[dist.ProcessGroup], optional): The distributed process group. If None, the default
+            process group is used. Defaults to None.
+        bwd_event_sync (bool, optional): If True, synchronizes a CUDA event in the backward pass to
+            control GPU memory allocation and prevent spikes. Defaults to False.
+
+    Returns:
+        Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, None]]:
+            - The attention output tensor if `return_attn_probs` is False.
+            - A tuple `(output, lse, None)` if `return_attn_probs` is True.
+    """
     return LlamaRingFlashAttnFunc.apply(
         q,
         k,
         v,
         heads_k_stride,
+        head_first_stride,
         dropout_p,
         softmax_scale,
         causal,
