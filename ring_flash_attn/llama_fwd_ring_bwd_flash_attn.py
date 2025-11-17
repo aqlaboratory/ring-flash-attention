@@ -26,7 +26,6 @@ def llama_flash_attn_forward(
     k: torch.Tensor,
     v: torch.Tensor,
     heads_k_stride: int,
-    head_first_stride: Optional[int] = None,
     softmax_scale: float,
     dropout_p: float = 0.0,
     causal: bool = True,
@@ -34,6 +33,7 @@ def llama_flash_attn_forward(
     softcap: float = 0.0,
     alibi_slopes: Optional[torch.Tensor] = None,
     deterministic: bool = False,
+    head_first_stride: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Llama-style flash attention forward pass with ring communication.
@@ -48,8 +48,6 @@ def llama_flash_attn_forward(
         k (torch.Tensor): Key tensor of shape `(batch_size, seq_len, num_kv_heads, head_dim)`.
         v (torch.Tensor): Value tensor of shape `(batch_size, seq_len, num_kv_heads, head_dim)`.
         heads_k_stride (int): The number of key/value heads to process in each communication step.
-        head_first_stride (Optional[int], optional): A different (smaller) stride for the first group of heads.
-            This is an optimization to increase communication/computation overlap. Defaults to None.
         softmax_scale (float): The scale factor for softmax.
         dropout_p (float, optional): Dropout probability. Defaults to 0.0.
         causal (bool, optional): Whether to apply causal masking. Defaults to True.
@@ -57,6 +55,8 @@ def llama_flash_attn_forward(
         softcap (float, optional): Softcap for attention scores. Defaults to 0.0.
         alibi_slopes (Optional[torch.Tensor], optional): ALiBi slopes for positional bias. Defaults to None.
         deterministic (bool, optional): Whether to use deterministic algorithms. Defaults to False.
+        head_first_stride (Optional[int], optional): A different (smaller) stride for the first group of heads.
+            This is an optimization to increase communication/computation overlap. Defaults to None.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
