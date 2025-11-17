@@ -2,7 +2,7 @@ import sys
 import torch
 import torch.distributed as dist
 from flash_attn import flash_attn_qkvpacked_func
-from ring_flash_attn.llama_fwd_ring_bwd_flash_attn import llama_fwd_ring_bwd_flash_attn_func
+from ring_flash_attn.llama_fwd_ring_bwd_flash_attn import llama_flash_attn_func
 from utils import log, set_seed
 
 def main():
@@ -61,7 +61,7 @@ def main():
 
     # --- Test Subject: Ring Attention ---
     # FIX 1: Correct variable name for compilation hook
-    fn = llama_fwd_ring_bwd_flash_attn_func
+    fn = llama_flash_attn_func 
     
     # FIX 2: Removed .squeeze(2). Indexing [:,:,0] results in (B, S, H, D)
     ring_out, ring_lse, _ = fn(
