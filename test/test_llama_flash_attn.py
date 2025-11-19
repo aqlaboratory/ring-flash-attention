@@ -13,9 +13,9 @@ def main():
     dtype = torch.bfloat16
     device = torch.device(f"cuda:{rank}")
 
-    batch_size = 1
+    batch_size = 8
     seqlen = 3816
-    nheads = 5
+    nheads = 6
     d = 128
     dropout_p = 0
     causal = False
@@ -68,8 +68,8 @@ def main():
         local_qkv[:,:,0], 
         local_qkv[:,:,1], 
         local_qkv[:,:,2], 
-        heads_k_stride=1,
-        bwd_event_sync=False,
+        heads_k_stride=2,
+        bwd_event_sync=True,
         dropout_p=dropout_p,
         causal=causal,
         window_size=(-1, -1),
