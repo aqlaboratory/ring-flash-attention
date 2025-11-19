@@ -277,24 +277,32 @@ def llama_flash_attn_backward(
     )
     kv_buffer_copy = torch.empty_like(kv_buffer)
 
+    # Buffer for gradients coming OUT of Flash Attention
+    # Shape: [Batch, Seq * WorldSize, Heads, HeadDim]
     dkv_buffer = torch.empty(
         (2, batch_k, seq_k * world_size, heads_k_stride, head_dim),
         dtype=k.dtype,
         device=k.device,
     ) 
 
-    if heads_k_stride != nheads_k:
-        # for reduce_scatter_tensor
-        kv_contiguous_buffer = torch.empty(
-            (2, batch_k, seq_k, heads_k_stride, head_dim),
-            dtype=torch.float32,
-            device=k.device,
-        )
+    # Buffer for input to reduce_scatter (Needs to be rank-contiguous)
+    scatter_input_buffer = torch.empty(
+        (2, world_size, batch_k, seq_k, heads_k_stride, head_dim),
+        dtype=torch.float32,
+        device=k.device,
+    )
 
+    # Buffer for output of reduce_scatter (Float32 for stability)
+    # We use this regardless of stride since dk.float() would require full copies
+    dkv_reduce_output_buffer = torch.empty(
+        (2, batch_k, seq_k, heads_k_stride, head_dim),
+        dtype=torch.float32,
+        device=k.device,
+    )
     
     dq = torch.empty_like(q)
-    dk = torch.zeros_like(k)
-    dv = torch.zeros_like(v)
+    dk = torch.empty_like(k)
+    dv = torch.empty_like(v)
 
     comm = Comm(process_group)
 
@@ -306,6 +314,7 @@ def llama_flash_attn_backward(
     comm.all_gather(kv_buffer_copy[1], v_0)
 
     for i in range(0, nheads_k, heads_k_stride):
+        # Must zero out because for Causal, we don't write to the entire sequence length
         dkv_buffer.zero_()
 
         q_slice = slice(
@@ -323,7 +332,6 @@ def llama_flash_attn_backward(
         comm.wait()
         # Swap the main storage tensors
         kv_buffer, kv_buffer_copy = kv_buffer_copy, kv_buffer
-        # logging.debug(f"bwd i {i} q_slice {q_slice} kshape {k.shape} dv.shape {dv.shape} q.shape {q.shape}")     
 
         if i < nheads_k - heads_k_stride:
             # all_gather the next kv slice
@@ -338,13 +346,13 @@ def llama_flash_attn_backward(
         # kv_buffer[0] has shape (batch_k, seq_k, world_size, heads_k_stride, head_dim)
         # We want k_i to be (batch_k, seq_k * world_size, heads_k_stride, head_dim)
         if causal:
-            k_i = kv_buffer[0][:(rank + 1), :, :, :, :].contiguous()
-            v_i = kv_buffer[1][:(rank + 1), :, :, :, :].contiguous()
-            k_i = rearrange(k_i, 'w b s hs dh -> b (w s) hs dh')
-            v_i = rearrange(v_i, 'w b s hs dh -> b (w s) hs dh')
+            k_i = kv_buffer[0][:(rank + 1)]
+            v_i = kv_buffer[1][:(rank + 1)]
+            k_i = rearrange(k_i, 'w b s hs dh -> b (w s) hs dh').contiguous()
+            v_i = rearrange(v_i, 'w b s hs dh -> b (w s) hs dh').contiguous()
         else:
-            k_i = rearrange(kv_buffer[0], 'w b s hs dh -> b (w s) hs dh')
-            v_i = rearrange(kv_buffer[1], 'w b s hs dh -> b (w s) hs dh')
+            k_i = rearrange(kv_buffer[0], 'w b s hs dh -> b (w s) hs dh').contiguous()
+            v_i = rearrange(kv_buffer[1], 'w b s hs dh -> b (w s) hs dh').contiguous()
 
         if causal:
             # dk must have the same shape as k
@@ -374,28 +382,34 @@ def llama_flash_attn_backward(
                 "alibi_slopes": alibi_slopes,
                 "deterministic": deterministic,
         }
-        # logging.debug(f"i {i} q {params['q'].shape} k {params['k'].shape} v {params['v'].shape} dout {params['dout'].shape} softmax_lse {params['softmax_lse'].shape}")     
         _wrapped_flash_attn_backward(**params)
 
+        # We do not need k_i, v_i, or the slices anymore.
+        del k_i, v_i, q_i, dout_i, out_i
+
+        # Target for reduce_scatter is always our FP32 buffer
+        dk_i = dkv_reduce_output_buffer[0]
+        dv_i = dkv_reduce_output_buffer[1]
+
+        # Rearrange dkv_buffer so the first dimension represents the World Rank.
+        # dkv_buffer is [2, B, W*S, H, D]. We need to transform to [2, W, B, S, H, D]
+        # 1. View: Split W*S -> W, S.  Shape: [2, B, W, S, H, D]
+        grad_view = dkv_buffer.view(2, batch_k, world_size, seq_k, heads_k_stride, head_dim)
+        # 2. Permute: Swap B and W. Shape: [2, W, B, S, H, D]
+        grad_permuted = grad_view.permute(0, 2, 1, 3, 4, 5)
+        scatter_input_buffer.copy_(grad_permuted)
+
+        # dist.reduce_scatter_tensor concat, gather, reduce on dim=0
+        dist.reduce_scatter_tensor(dk_i, scatter_input_buffer[0], group=process_group)
+        dist.reduce_scatter_tensor(dv_i, scatter_input_buffer[1], group=process_group)
+
+        # Final copy back to main bf16/fp16 tensor
         if heads_k_stride != nheads_k:
-            # The output of reduce_scatter_tensor needs to be contiguous.
-            # We use a dedicated buffer for this.
-            # reduce_scatter needs contiguous buffer
-            dk_i = kv_contiguous_buffer[0]
-            dv_i = kv_contiguous_buffer[1]
+            dk[:, :, i : i + heads_k_stride].copy_(dk_i)
+            dv[:, :, i : i + heads_k_stride].copy_(dv_i)
         else:
-            # If we only have one group of heads, we can write directly to the final output tensors.
-            dk_i = dk
-            dv_i = dv
-
-        # dkv_buffer contains the gradients for the full gathered K/V.
-        dist.reduce_scatter_tensor(dk_i, dkv_buffer[0].float(), group=process_group)
-        dist.reduce_scatter_tensor(dv_i, dkv_buffer[1].float(), group=process_group)
-
-        if heads_k_stride != nheads_k:
-            dk[:, :, i : i + heads_k_stride] = dk_i.type_as(dk)
-            dv[:, :, i : i + heads_k_stride] = dv_i.type_as(dv)
-
+            dk.copy_(dk_i)
+            dv.copy_(dv_i)
 
     return dq, dk, dv
 

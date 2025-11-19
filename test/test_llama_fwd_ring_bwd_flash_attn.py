@@ -14,7 +14,7 @@ def main():
     device = torch.device(f"cuda:{rank}")
 
     batch_size = 1
-    seqlen = 3816
+    seqlen = 8196 #3816
     nheads = 5
     d = 128
     dropout_p = 0
