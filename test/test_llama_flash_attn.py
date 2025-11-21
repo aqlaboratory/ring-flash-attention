@@ -2,7 +2,7 @@ import sys
 import torch
 import torch.distributed as dist
 from flash_attn import flash_attn_qkvpacked_func
-from ring_flash_attn.llama_fwd_ring_bwd_flash_attn import llama_fwd_ring_bwd_flash_attn_func
+from ring_flash_attn.llama_fwd_ring_bwd_flash_attn import llama_flash_attn_func
 from utils import log, set_seed
 
 def main():
@@ -61,15 +61,15 @@ def main():
 
     # --- Test Subject: Ring Attention ---
     # FIX 1: Correct variable name for compilation hook
-    fn = llama_fwd_ring_bwd_flash_attn_func
+    fn = llama_flash_attn_func 
     
     # FIX 2: Removed .squeeze(2). Indexing [:,:,0] results in (B, S, H, D)
     ring_out, ring_lse, _ = fn(
         local_qkv[:,:,0], 
         local_qkv[:,:,1], 
         local_qkv[:,:,2], 
-        heads_k_stride=1,
-        bwd_event_sync=False,
+        heads_k_stride=2,
+        bwd_event_sync=True,
         dropout_p=dropout_p,
         causal=causal,
         window_size=(-1, -1),
@@ -113,5 +113,5 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "compile":
         torch._dynamo.config.capture_scalar_outputs = True
         # FIX 1 (continued): Compile the actual function used
-        llama_fwd_ring_bwd_flash_attn_func = torch.compile(llama_fwd_ring_bwd_flash_attn_func)
+        llama_flash_attn_func = torch.compile(llama_flash_attn_func)
     main()

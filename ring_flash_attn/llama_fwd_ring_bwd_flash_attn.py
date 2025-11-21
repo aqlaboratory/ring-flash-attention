@@ -236,12 +236,39 @@ def llama_flash_attn_backward(
     alibi_slopes=None,
     deterministic=False,
 ):
-    raise NotImplementedError("Backward pass is broken")
+    """
+    Llama-style flash attention backward pass.
+
+    This function performs the backward pass of attention, distributing the key and value tensors
+    across a process group using all-gather operations.
+
+    Args:
+        process_group (dist.ProcessGroup): The distributed process group for communication.
+        dout (torch.Tensor): Gradient of the output tensor.
+        q (torch.Tensor): Query tensor from the forward pass.
+        k (torch.Tensor): Key tensor from the forward pass.
+        v (torch.Tensor): Value tensor from the forward pass.
+        out (torch.Tensor): Output tensor from the forward pass.
+        softmax_lse (torch.Tensor): Log-sum-exp of the attention scores from the forward pass.
+        heads_k_stride (int): The number of key/value heads to process in each communication step.
+        softmax_scale (float): The scale factor for softmax.
+        dropout_p (float, optional): Dropout probability. Defaults to 0.0.
+        causal (bool, optional): Whether to apply causal masking. Defaults to True.
+        window_size (Tuple[int, int], optional): Sliding window size for attention. Defaults to (-1, -1).
+        softcap (float, optional): Softcap for attention scores. Defaults to 0.0.
+        alibi_slopes (Optional[torch.Tensor], optional): ALiBi slopes for positional bias. Defaults to None.
+        deterministic (bool, optional): Whether to use deterministic algorithms. Defaults to False.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: A tuple containing the gradients with respect to
+            the query, key, and value tensors (`dq`, `dk`, `dv`).
+    """
     nheads = q.shape[2]
     batch_k, seq_k, nheads_k, head_dim = k.shape
     assert nheads_k % heads_k_stride == 0
 
     world_size = dist.get_world_size(process_group)
+    rank = dist.get_rank(process_group)
     
     kv_buffer = torch.empty(
         (2, world_size, batch_k, seq_k, heads_k_stride, head_dim),
@@ -250,20 +277,28 @@ def llama_flash_attn_backward(
     )
     kv_buffer_copy = torch.empty_like(kv_buffer)
 
+    # Buffer for gradients coming OUT of Flash Attention
+    # Shape: [Batch, Seq * WorldSize, Heads, HeadDim]
     dkv_buffer = torch.empty(
         (2, batch_k, seq_k * world_size, heads_k_stride, head_dim),
         dtype=k.dtype,
         device=k.device,
     ) 
 
-    if heads_k_stride != nheads_k:
-        # for reduce_scatter_tensor
-        kv_contiguous_buffer = torch.empty(
-            (2, batch_k, seq_k, heads_k_stride, head_dim),
-            dtype=k.dtype,
-            device=k.device,
-        )
+    # Buffer for input to reduce_scatter (Needs to be rank-contiguous)
+    scatter_input_buffer = torch.empty(
+        (2, world_size, batch_k, seq_k, heads_k_stride, head_dim),
+        dtype=torch.float32,
+        device=k.device,
+    )
 
+    # Buffer for output of reduce_scatter (Float32 for stability)
+    # We use this regardless of stride since dk.float() would require full copies
+    dkv_reduce_output_buffer = torch.empty(
+        (2, batch_k, seq_k, heads_k_stride, head_dim),
+        dtype=torch.float32,
+        device=k.device,
+    )
     
     dq = torch.empty_like(q)
     dk = torch.empty_like(k)
@@ -279,6 +314,7 @@ def llama_flash_attn_backward(
     comm.all_gather(kv_buffer_copy[1], v_0)
 
     for i in range(0, nheads_k, heads_k_stride):
+        # Must zero out because for Causal, we don't write to the entire sequence length
         dkv_buffer.zero_()
 
         q_slice = slice(
@@ -296,7 +332,6 @@ def llama_flash_attn_backward(
         comm.wait()
         # Swap the main storage tensors
         kv_buffer, kv_buffer_copy = kv_buffer_copy, kv_buffer
-        # logging.debug(f"bwd i {i} q_slice {q_slice} kshape {k.shape} dv.shape {dv.shape} q.shape {q.shape}")     
 
         if i < nheads_k - heads_k_stride:
             # all_gather the next kv slice
@@ -310,10 +345,22 @@ def llama_flash_attn_backward(
 
         # kv_buffer[0] has shape (batch_k, seq_k, world_size, heads_k_stride, head_dim)
         # We want k_i to be (batch_k, seq_k * world_size, heads_k_stride, head_dim)
-        k_i = rearrange(kv_buffer[0], 'w b s hs dh -> b (w s) hs dh')
-        v_i = rearrange(kv_buffer[1], 'w b s hs dh -> b (w s) hs dh')
-        dk_i = dkv_buffer[0]
-        dv_i = dkv_buffer[1]
+        if causal:
+            k_i = kv_buffer[0][:(rank + 1)]
+            v_i = kv_buffer[1][:(rank + 1)]
+            k_i = rearrange(k_i, 'w b s hs dh -> b (w s) hs dh').contiguous()
+            v_i = rearrange(v_i, 'w b s hs dh -> b (w s) hs dh').contiguous()
+        else:
+            k_i = rearrange(kv_buffer[0], 'w b s hs dh -> b (w s) hs dh').contiguous()
+            v_i = rearrange(kv_buffer[1], 'w b s hs dh -> b (w s) hs dh').contiguous()
+
+        if causal:
+            # dk must have the same shape as k
+            dk_i = dkv_buffer[0][:, :k_i.shape[1]]
+            dv_i = dkv_buffer[1][:, :k_i.shape[1]]
+        else:
+            dk_i = dkv_buffer[0]
+            dv_i = dkv_buffer[1]
 
         # params = get_default_args(_flash_attn_varlen_backward).copy()
         params = {
@@ -335,23 +382,34 @@ def llama_flash_attn_backward(
                 "alibi_slopes": alibi_slopes,
                 "deterministic": deterministic,
         }
-        # logging.debug(f"i {i} q {params['q'].shape} k {params['k'].shape} v {params['v'].shape} dout {params['dout'].shape} softmax_lse {params['softmax_lse'].shape}")     
         _wrapped_flash_attn_backward(**params)
 
+        # We do not need k_i, v_i, or the slices anymore.
+        del k_i, v_i, q_i, dout_i, out_i
+
+        # Target for reduce_scatter is always our FP32 buffer
+        dk_i = dkv_reduce_output_buffer[0]
+        dv_i = dkv_reduce_output_buffer[1]
+
+        # Rearrange dkv_buffer so the first dimension represents the World Rank.
+        # dkv_buffer is [2, B, W*S, H, D]. We need to transform to [2, W, B, S, H, D]
+        # 1. View: Split W*S -> W, S.  Shape: [2, B, W, S, H, D]
+        grad_view = dkv_buffer.view(2, batch_k, world_size, seq_k, heads_k_stride, head_dim)
+        # 2. Permute: Swap B and W. Shape: [2, W, B, S, H, D]
+        grad_permuted = grad_view.permute(0, 2, 1, 3, 4, 5)
+        scatter_input_buffer.copy_(grad_permuted)
+
+        # dist.reduce_scatter_tensor concat, gather, reduce on dim=0
+        dist.reduce_scatter_tensor(dk_i, scatter_input_buffer[0], group=process_group)
+        dist.reduce_scatter_tensor(dv_i, scatter_input_buffer[1], group=process_group)
+
+        # Final copy back to main bf16/fp16 tensor
         if heads_k_stride != nheads_k:
-            # reduce_scatter needs contiguous buffer
-            dk_i = kv_contiguous_buffer[0]
-            dv_i = kv_contiguous_buffer[1]
+            dk[:, :, i : i + heads_k_stride].copy_(dk_i)
+            dv[:, :, i : i + heads_k_stride].copy_(dv_i)
         else:
-            dk_i = dk
-            dv_i = dv
-
-        dist.reduce_scatter_tensor(dk_i, dkv_buffer[0], group=process_group)
-        dist.reduce_scatter_tensor(dv_i, dkv_buffer[1], group=process_group)
-
-        if heads_k_stride != nheads_k:
-            dk[:, :, i : i + heads_k_stride] = dk_i
-            dv[:, :, i : i + heads_k_stride] = dv_i
+            dk.copy_(dk_i)
+            dv.copy_(dv_i)
 
     return dq, dk, dv
 
@@ -466,6 +524,7 @@ class LlamaRingFlashAttnFunc(torch.autograd.Function):
         time_event = None
         if ctx.bwd_event_sync:
             time_event = torch.cuda.Event(enable_timing=False)
+            time_event.record()
         q, k, v, out, softmax_lse = ctx.saved_tensors
         dq, dk, dv = ring_flash_attn_backward(
             ctx.group,
@@ -481,11 +540,10 @@ class LlamaRingFlashAttnFunc(torch.autograd.Function):
             window_size=ctx.window_size,
             alibi_slopes=ctx.alibi_slopes,
             deterministic=ctx.deterministic,
-            time_event=time_event,
         )
         if ctx.bwd_event_sync:
             time_event.synchronize()
-        # return dq, dk, dv, None, None, None, None, None, None, None, None
+        # forward takes 14 args excluding ctx. return 3 grad + 11 None
         return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None
 
 class LlamaFlashAttnFunc(torch.autograd.Function):
@@ -494,32 +552,63 @@ class LlamaFlashAttnFunc(torch.autograd.Function):
     """
     @staticmethod
     def forward(
-        ctx,
-        q,
-        k,
-        v,
-        heads_k_stride,
-        # local_k_slice,
-        dropout_p,
-        softmax_scale,
-        causal,
-        window_size,
-        alibi_slopes,
-        deterministic,
-        return_softmax,
-        group,
-    ):
+        ctx: torch.autograd.function.FunctionCtx,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        heads_k_stride: int,
+        head_first_stride: Optional[int],
+        dropout_p: float,
+        softmax_scale: Optional[float],
+        causal: bool,
+        window_size: Tuple[int, int],
+        alibi_slopes: Optional[torch.Tensor],
+        deterministic: bool,
+        return_softmax: bool,
+        group: dist.ProcessGroup,
+        bwd_event_sync: bool,
+    ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor, None]:
+        """
+        Forward pass for Llama-style ring attention.
+        For loop in llama_flash_attn_forward could lead to early allocation of tensors
+        by the CPU, leading to memory explosion. CUDA event syncing can control this.
+        Let parent model handle forward event syncing for efficiency.
+
+        Args:
+            ctx: The context object for autograd.
+            q (torch.Tensor): Query tensor.
+            k (torch.Tensor): Key tensor.
+            v (torch.Tensor): Value tensor.
+            heads_k_stride (int): Stride for key/value heads in GQA/MQA.
+            head_first_stride (Optional[int]): A different stride for the first group of heads.
+            dropout_p (float): Dropout probability.
+            softmax_scale (Optional[float]): Scale factor for softmax. If None, calculated from head dimension.
+            causal (bool): Whether to apply causal masking.
+            window_size (Tuple[int, int]): Sliding window size.
+            alibi_slopes (Optional[torch.Tensor]): ALiBi slopes for positional bias.
+            deterministic (bool): Whether to use deterministic algorithms.
+            return_softmax (bool): Whether to return the softmax log-sum-exp.
+            group (dist.ProcessGroup): The distributed process group.
+            bwd_event_sync (bool): If True, syncs a CUDA event in the backward pass to control memory allocation.
+
+        Returns:
+            Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, None]]: The attention output, and optionally the LSE and a None placeholder.
+        """
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
+
         assert alibi_slopes is None
         k = k.contiguous()
         v = v.contiguous()
+        # out shape (batch, seq, heads, head_dim)
+        # softmax_lse shape (batch, seq, heads)
         out, softmax_lse = llama_flash_attn_forward(
             group,
             q,
             k,
             v,
             heads_k_stride=heads_k_stride,
+            head_first_stride=head_first_stride,
             softmax_scale=softmax_scale,
             dropout_p=dropout_p,
             causal=causal,
@@ -527,21 +616,24 @@ class LlamaFlashAttnFunc(torch.autograd.Function):
             alibi_slopes=alibi_slopes,
             deterministic=False,
         )
-        # logging.debug(f"out {out[0,:2,3,:4]} softmax_lse {softmax_lse[0,:2,:5]}")     
-        # this should be out_padded
         ctx.save_for_backward(q, k, v, out, softmax_lse)
         ctx.dropout_p = dropout_p
-        ctx.heads_k_stride = heads_k_stride
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
         ctx.alibi_slopes = alibi_slopes
         ctx.deterministic = deterministic
         ctx.group = group
+        ctx.bwd_event_sync = bwd_event_sync
+        ctx.heads_k_stride = heads_k_stride
         return out if not return_softmax else (out, softmax_lse, None)
 
     @staticmethod
     def backward(ctx, dout, *args):
+        time_event = None
+        if ctx.bwd_event_sync:
+            time_event = torch.cuda.Event(enable_timing=False)
+            time_event.record()
         q, k, v, out, softmax_lse = ctx.saved_tensors
         dq, dk, dv = llama_flash_attn_backward(
             ctx.group,
@@ -559,8 +651,10 @@ class LlamaFlashAttnFunc(torch.autograd.Function):
             alibi_slopes=ctx.alibi_slopes,
             deterministic=ctx.deterministic,
         )
-        # return dq, dk, dv, None, None, None, None, None, None, None, None
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None
+        if ctx.bwd_event_sync:
+            time_event.synchronize()
+        # forward takes 14 args excluding ctx. return 3 grad + 11 None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None
 
 
 def llama_fwd_ring_bwd_flash_attn_func(
@@ -633,26 +727,28 @@ def llama_fwd_ring_bwd_flash_attn_func(
     )
 
 def llama_flash_attn_func(
-    q,
-    k,
-    v,
-    heads_k_stride=1,  # default 1 always works, but need optimize
-    dropout_p=0.0,
-    softmax_scale=None,
-    causal=False,
-    window_size=(-1, -1),
-    alibi_slopes=None,
-    deterministic=False,
-    return_attn_probs=False,
-    group=None,
-    bwd_event_sync=False,
-):
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    heads_k_stride: int = 1,
+    head_first_stride: Optional[int] = None,
+    dropout_p: float = 0.0,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    window_size: Tuple[int, int] = (-1, -1),
+    alibi_slopes: Optional[torch.Tensor] = None,
+    deterministic: bool = False,
+    return_attn_probs: bool = False,
+    group: Optional[dist.ProcessGroup] = None,
+    bwd_event_sync: bool = False,
+) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor, None]:
     # logging.debug(f"q {q[0,:2,3,:4]}")
     return LlamaFlashAttnFunc.apply(
         q,
         k,
         v,
         heads_k_stride,
+        head_first_stride,
         dropout_p,
         softmax_scale,
         causal,
@@ -661,6 +757,7 @@ def llama_flash_attn_func(
         deterministic,
         return_attn_probs,
         group,
+        bwd_event_sync,
     )
 
 from .llama3_flash_attn_varlen import llama3_flash_attn_varlen_backward, llama3_flash_attn_varlen_forward, llama3_flash_attn_prepare_cu_seqlens, Llama3FlashAttnVarlenFunc
