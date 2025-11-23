@@ -112,6 +112,8 @@ def ring_flash_attn_backward(
     for step in range(kv_comm.world_size):
         if step + 1 != kv_comm.world_size:
             next_k, next_v = kv_comm.send_recv_kv(k, v)
+        elif time_event is not None:
+            time_event.record()
 
         if step <= kv_comm.rank or not causal:
             bwd_causal = causal and step == 0

@@ -235,6 +235,7 @@ def llama_flash_attn_backward(
     softcap=0.0,
     alibi_slopes=None,
     deterministic=False,
+    time_event=None,
 ):
     """
     Llama-style flash attention backward pass.
@@ -411,6 +412,9 @@ def llama_flash_attn_backward(
             dk.copy_(dk_i)
             dv.copy_(dv_i)
 
+        if i == 0 and time_event is not None:
+            time_event.record()
+
     return dq, dk, dv
 
 
@@ -524,7 +528,6 @@ class LlamaRingFlashAttnFunc(torch.autograd.Function):
         time_event = None
         if ctx.bwd_event_sync:
             time_event = torch.cuda.Event(enable_timing=False)
-            time_event.record()
         q, k, v, out, softmax_lse = ctx.saved_tensors
         dq, dk, dv = ring_flash_attn_backward(
             ctx.group,
@@ -540,6 +543,7 @@ class LlamaRingFlashAttnFunc(torch.autograd.Function):
             window_size=ctx.window_size,
             alibi_slopes=ctx.alibi_slopes,
             deterministic=ctx.deterministic,
+            time_event=time_event,
         )
         if ctx.bwd_event_sync:
             time_event.synchronize()
@@ -633,7 +637,6 @@ class LlamaFlashAttnFunc(torch.autograd.Function):
         time_event = None
         if ctx.bwd_event_sync:
             time_event = torch.cuda.Event(enable_timing=False)
-            time_event.record()
         q, k, v, out, softmax_lse = ctx.saved_tensors
         dq, dk, dv = llama_flash_attn_backward(
             ctx.group,
@@ -650,6 +653,7 @@ class LlamaFlashAttnFunc(torch.autograd.Function):
             window_size=ctx.window_size,
             alibi_slopes=ctx.alibi_slopes,
             deterministic=ctx.deterministic,
+            time_event=time_event,
         )
         if ctx.bwd_event_sync:
             time_event.synchronize()
