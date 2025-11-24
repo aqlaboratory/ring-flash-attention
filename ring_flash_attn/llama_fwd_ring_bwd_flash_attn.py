@@ -552,7 +552,7 @@ class LlamaRingFlashAttnFunc(torch.autograd.Function):
 
 class LlamaFlashAttnFunc(torch.autograd.Function):
     """
-    Autograd function for Llama-style attention. NOT FINISHED
+    Autograd function for Llama-style attention.
     """
     @staticmethod
     def forward(
@@ -848,3 +848,384 @@ def llama3_flash_attn_varlen_custom_func(
             ).redistribute(mesh, [distp_tensor.Shard(1)]).to_local() 
         logging.debug(f" out {output[0,:2,3,:4]}")     
         return output
+
+
+class ConditionalLlamaFlashAttnFunc(torch.autograd.Function):
+    """
+    Autograd function for conditional Llama-style attention.
+    """
+    @staticmethod
+    def forward(
+        ctx: torch.autograd.function.FunctionCtx,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        heads_k_stride: int,
+        head_first_stride: Optional[int],
+        dropout_p: float,
+        softmax_scale: Optional[float],
+        causal: bool,
+        window_size: Tuple[int, int],
+        alibi_slopes: Optional[torch.Tensor],
+        deterministic: bool,
+        return_softmax: bool,
+        group: dist.ProcessGroup,
+        bwd_event_sync: bool,
+    ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor, None]:
+        """
+        Forward pass for Llama-style ring attention, conditionally use standard flash_attn_forward.
+        When group=None, assume full sequence is on single device and use standard flash_attn_forward.
+        For loop in llama_flash_attn_forward could lead to early allocation of tensors
+        by the CPU, leading to memory explosion. CUDA event syncing can control this.
+        Let parent model handle forward event syncing for efficiency.
+
+        Args:
+            ctx: The context object for autograd.
+            q (torch.Tensor): Query tensor.
+            k (torch.Tensor): Key tensor.
+            v (torch.Tensor): Value tensor.
+            heads_k_stride (int): Stride for key/value heads in GQA/MQA.
+            head_first_stride (Optional[int]): A different stride for the first group of heads.
+            dropout_p (float): Dropout probability.
+            softmax_scale (Optional[float]): Scale factor for softmax. If None, calculated from head dimension.
+            causal (bool): Whether to apply causal masking.
+            window_size (Tuple[int, int]): Sliding window size.
+            alibi_slopes (Optional[torch.Tensor]): ALiBi slopes for positional bias.
+            deterministic (bool): Whether to use deterministic algorithms.
+            return_softmax (bool): Whether to return the softmax log-sum-exp.
+            group (dist.ProcessGroup): The distributed process group.
+            bwd_event_sync (bool): If True, syncs a CUDA event in the backward pass to control memory allocation.
+
+        Returns:
+            Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, None]]: The attention output, and optionally the LSE and a None placeholder.
+        """
+        if softmax_scale is None:
+            softmax_scale = q.shape[-1] ** (-0.5)
+
+        assert alibi_slopes is None
+
+        k = k.contiguous()
+        v = v.contiguous()
+
+        if group is None:
+            params = {
+                "q": q,
+                "k": k,
+                "v": v,
+                "dropout_p": dropout_p,
+                "softmax_scale": softmax_scale,
+                "causal": causal, # 'step' was not defined in this scope
+                "window_size_left": window_size[0],
+                "window_size_right": window_size[1],
+                "softcap": 0.0,
+                "alibi_slopes": alibi_slopes,
+                "return_softmax": True and dropout_p > 0,
+            }
+
+            outputs = _wrapped_flash_attn_forward(**params)
+            if len(outputs) == 8:
+                out, _, _, _, _, softmax_lse, _, _ = outputs
+            else:
+                assert len(outputs) == 4
+                out, softmax_lse, _, _ = outputs
+        else:
+            # out shape (batch, seq, heads, head_dim)
+            # softmax_lse shape (batch, seq, heads)
+            out, softmax_lse = llama_flash_attn_forward(
+                group,
+                q,
+                k,
+                v,
+                heads_k_stride=heads_k_stride,
+                head_first_stride=head_first_stride,
+                softmax_scale=softmax_scale,
+                dropout_p=dropout_p,
+                causal=causal,
+                window_size=window_size,
+                alibi_slopes=alibi_slopes,
+                deterministic=False,
+            )
+        ctx.save_for_backward(q, k, v, out, softmax_lse)
+        ctx.dropout_p = dropout_p
+        ctx.softmax_scale = softmax_scale
+        ctx.causal = causal
+        ctx.window_size = window_size
+        ctx.alibi_slopes = alibi_slopes
+        ctx.deterministic = deterministic
+        ctx.group = group
+        ctx.bwd_event_sync = bwd_event_sync
+        ctx.heads_k_stride = heads_k_stride
+        return out if not return_softmax else (out, softmax_lse, None)
+
+    @staticmethod
+    def backward(ctx, dout, *args):
+        time_event = None
+        q, k, v, out, softmax_lse = ctx.saved_tensors
+
+        if ctx.group is None:
+            dq = torch.empty_like(q)
+            dk = torch.empty_like(k)
+            dv = torch.empty_like(v)
+            params = {
+                "dout": dout,
+                "q": q,
+                "k": k,
+                "v": v,
+                "out": out,
+                "softmax_lse": softmax_lse,
+                "dq": dq,
+                "dk": dk,
+                "dv": dv,
+                "dropout_p": ctx.dropout_p,
+                "softmax_scale": ctx.softmax_scale,
+                "causal": ctx.causal,
+                "window_size_left": ctx.window_size[0],
+                "window_size_right": ctx.window_size[1],
+                "softcap": 0.0,
+                "alibi_slopes": ctx.alibi_slopes,
+                "deterministic": ctx.deterministic,
+            }
+            _wrapped_flash_attn_backward(**params)
+        else:
+            if ctx.bwd_event_sync:
+                time_event = torch.cuda.Event(enable_timing=False)
+            dq, dk, dv = llama_flash_attn_backward(
+                ctx.group,
+                dout,
+                q,
+                k,
+                v,
+                out,
+                softmax_lse,
+                heads_k_stride=ctx.heads_k_stride,
+                softmax_scale=ctx.softmax_scale,
+                dropout_p=ctx.dropout_p,
+                causal=ctx.causal,
+                window_size=ctx.window_size,
+                alibi_slopes=ctx.alibi_slopes,
+                deterministic=ctx.deterministic,
+                time_event=time_event,
+            )
+            if ctx.bwd_event_sync:
+                time_event.synchronize()
+        # forward takes 14 args excluding ctx. return 3 grad + 11 None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None
+
+
+class ConditionalLlamaRingFlashAttnFunc(torch.autograd.Function):
+    """
+    Autograd function for conditional Llama-style attention with ring backward.
+    """
+    @staticmethod
+    def forward(
+        ctx: torch.autograd.function.FunctionCtx,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        heads_k_stride: int,
+        head_first_stride: Optional[int],
+        dropout_p: float,
+        softmax_scale: Optional[float],
+        causal: bool,
+        window_size: Tuple[int, int],
+        alibi_slopes: Optional[torch.Tensor],
+        deterministic: bool,
+        return_softmax: bool,
+        group: dist.ProcessGroup,
+        bwd_event_sync: bool,
+    ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor, None]:
+        """
+        Forward pass for Llama-style ring attention, conditionally use standard flash_attn_forward.
+        When group=None, assume full sequence is on single device and use standard flash_attn_forward.
+        For loop in llama_flash_attn_forward could lead to early allocation of tensors
+        by the CPU, leading to memory explosion. CUDA event syncing can control this.
+        Let parent model handle forward event syncing for efficiency.
+
+        Args:
+            ctx: The context object for autograd.
+            q (torch.Tensor): Query tensor.
+            k (torch.Tensor): Key tensor.
+            v (torch.Tensor): Value tensor.
+            heads_k_stride (int): Stride for key/value heads in GQA/MQA.
+            head_first_stride (Optional[int]): A different stride for the first group of heads.
+            dropout_p (float): Dropout probability.
+            softmax_scale (Optional[float]): Scale factor for softmax. If None, calculated from head dimension.
+            causal (bool): Whether to apply causal masking.
+            window_size (Tuple[int, int]): Sliding window size.
+            alibi_slopes (Optional[torch.Tensor]): ALiBi slopes for positional bias.
+            deterministic (bool): Whether to use deterministic algorithms.
+            return_softmax (bool): Whether to return the softmax log-sum-exp.
+            group (dist.ProcessGroup): The distributed process group.
+            bwd_event_sync (bool): If True, syncs a CUDA event in the backward pass to control memory allocation.
+
+        Returns:
+            Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, None]]: The attention output, and optionally the LSE and a None placeholder.
+        """
+        if softmax_scale is None:
+            softmax_scale = q.shape[-1] ** (-0.5)
+
+        assert alibi_slopes is None
+
+        k = k.contiguous()
+        v = v.contiguous()
+
+        if group is None:
+            params = {
+                "q": q,
+                "k": k,
+                "v": v,
+                "dropout_p": dropout_p,
+                "softmax_scale": softmax_scale,
+                "causal": causal, # 'step' was not defined in this scope
+                "window_size_left": window_size[0],
+                "window_size_right": window_size[1],
+                "softcap": 0.0,
+                "alibi_slopes": alibi_slopes,
+                "return_softmax": True and dropout_p > 0,
+            }
+
+            outputs = _wrapped_flash_attn_forward(**params)
+            if len(outputs) == 8:
+                out, _, _, _, _, softmax_lse, _, _ = outputs
+            else:
+                assert len(outputs) == 4
+                out, softmax_lse, _, _ = outputs
+        else:
+            # out shape (batch, seq, heads, head_dim)
+            # softmax_lse shape (batch, seq, heads)
+            out, softmax_lse = llama_flash_attn_forward(
+                group,
+                q,
+                k,
+                v,
+                heads_k_stride=heads_k_stride,
+                head_first_stride=head_first_stride,
+                softmax_scale=softmax_scale,
+                dropout_p=dropout_p,
+                causal=causal,
+                window_size=window_size,
+                alibi_slopes=alibi_slopes,
+                deterministic=False,
+            )
+        ctx.save_for_backward(q, k, v, out, softmax_lse)
+        ctx.dropout_p = dropout_p
+        ctx.softmax_scale = softmax_scale
+        ctx.causal = causal
+        ctx.window_size = window_size
+        ctx.alibi_slopes = alibi_slopes
+        ctx.deterministic = deterministic
+        ctx.group = group
+        ctx.bwd_event_sync = bwd_event_sync
+        ctx.heads_k_stride = heads_k_stride
+        return out if not return_softmax else (out, softmax_lse, None)
+
+    @staticmethod
+    def backward(ctx, dout, *args):
+        time_event = None
+        q, k, v, out, softmax_lse = ctx.saved_tensors
+
+        if ctx.group is None:
+            return ConditionalLlamaFlashAttnFunc.backward(ctx, dout, *args)
+        else:
+            return LlamaRingFlashAttnFunc.backward(ctx, dout, *args)
+
+
+
+def cond_llama_fwd_ring_bwd_flash_attn_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    heads_k_stride: int = 1,
+    head_first_stride: Optional[int] = None,
+    dropout_p: float = 0.0,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    window_size: Tuple[int, int] = (-1, -1),
+    alibi_slopes: Optional[torch.Tensor] = None,
+    deterministic: bool = False,
+    return_attn_probs: bool = False,
+    group: Optional[dist.ProcessGroup] = None,
+    bwd_event_sync: bool = False,
+) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor, None]:
+    """
+    Performs Llama-style ring flash attention, conditionally use standard flash_attn_forward.
+        When group=None, assume full sequence is on single device and use standard flash_attn_forward.
+
+    This function is a wrapper around `ConditionalLlamaRingFlashAttnFunc`.
+    If a process group is provided, it uses a ring-based backward pass.
+    Otherwise, it falls back to a standard flash attention backward pass.
+
+    Args:
+        q (torch.Tensor): Query tensor.
+        k (torch.Tensor): Key tensor.
+        v (torch.Tensor): Value tensor.
+        heads_k_stride (int, optional): Stride for key/value heads. Defaults to 1.
+        head_first_stride (Optional[int], optional): Different stride for the first group of heads. Defaults to None.
+        dropout_p (float, optional): Dropout probability. Defaults to 0.0.
+        softmax_scale (Optional[float], optional): Softmax scale factor. Defaults to None.
+        causal (bool, optional): Whether to apply causal masking. Defaults to False.
+        window_size (Tuple[int, int], optional): Sliding window size. Defaults to (-1, -1).
+        alibi_slopes (Optional[torch.Tensor], optional): ALiBi slopes. Defaults to None.
+        deterministic (bool, optional): Whether to use deterministic algorithms. Defaults to False.
+        return_attn_probs (bool, optional): Whether to return LSE. Defaults to False.
+        group (Optional[dist.ProcessGroup], optional): The distributed process group. Defaults to None.
+        bwd_event_sync (bool, optional): If True, syncs a CUDA event in backward. Defaults to False.
+
+    Returns:
+        Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, None]]: Attention output.
+    """
+    return ConditionalLlamaRingFlashAttnFunc.apply(
+        q,
+        k,
+        v,
+        heads_k_stride,
+        head_first_stride,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size,
+        alibi_slopes,
+        deterministic,
+        return_attn_probs,
+        group,
+        bwd_event_sync,
+    )
+
+
+def cond_llama_flash_attn_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    heads_k_stride: int = 1,
+    head_first_stride: Optional[int] = None,
+    dropout_p: float = 0.0,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    window_size: Tuple[int, int] = (-1, -1),
+    alibi_slopes: Optional[torch.Tensor] = None,
+    deterministic: bool = False,
+    return_attn_probs: bool = False,
+    group: Optional[dist.ProcessGroup] = None,
+    bwd_event_sync: bool = False,
+) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor, None]:
+    """
+
+    This function wraps `ConditionalLlamaFlashAttnFunc`
+    which conditionally selects the backward pass based on whether a process group is provided.
+    """
+    return ConditionalLlamaFlashAttnFunc.apply(
+        q,
+        k,
+        v,
+        heads_k_stride,
+        head_first_stride,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size,
+        alibi_slopes,
+        deterministic,
+        return_attn_probs,
+        group,
+        bwd_event_sync,
+    )

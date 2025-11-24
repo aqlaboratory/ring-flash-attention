@@ -96,6 +96,7 @@ def ring_flash_attn_backward(
     softcap=0.0,
     alibi_slopes=None,
     deterministic=False,
+    time_event=None,  # Sync GPU,CPU to lower vRAM allocation; no sync by default
 ):
     kv_comm = RingComm(process_group)
     d_kv_comm = RingComm(process_group)
