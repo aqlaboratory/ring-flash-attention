@@ -962,6 +962,9 @@ class ConditionalLlamaFlashAttnFunc(torch.autograd.Function):
         time_event = None
         q, k, v, out, softmax_lse = ctx.saved_tensors
 
+        if ctx.bwd_event_sync:
+            time_event = torch.cuda.Event(enable_timing=False)
+
         if ctx.group is None:
             dq = torch.empty_like(q)
             dk = torch.empty_like(k)
@@ -986,9 +989,9 @@ class ConditionalLlamaFlashAttnFunc(torch.autograd.Function):
                 "deterministic": ctx.deterministic,
             }
             _wrapped_flash_attn_backward(**params)
-        else:
             if ctx.bwd_event_sync:
-                time_event = torch.cuda.Event(enable_timing=False)
+                time_event.record()
+        else:
             dq, dk, dv = llama_flash_attn_backward(
                 ctx.group,
                 dout,
@@ -1006,8 +1009,8 @@ class ConditionalLlamaFlashAttnFunc(torch.autograd.Function):
                 deterministic=ctx.deterministic,
                 time_event=time_event,
             )
-            if ctx.bwd_event_sync:
-                time_event.synchronize()
+        if ctx.bwd_event_sync:
+            time_event.synchronize()
         # forward takes 14 args excluding ctx. return 3 grad + 11 None
         return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None
 
@@ -1121,8 +1124,6 @@ class ConditionalLlamaRingFlashAttnFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
-        time_event = None
-        q, k, v, out, softmax_lse = ctx.saved_tensors
 
         if ctx.group is None:
             return ConditionalLlamaFlashAttnFunc.backward(ctx, dout, *args)
