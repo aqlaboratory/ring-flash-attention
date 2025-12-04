@@ -259,6 +259,7 @@ def llama_flash_attn_backward(
         softcap (float, optional): Softcap for attention scores. Defaults to 0.0.
         alibi_slopes (Optional[torch.Tensor], optional): ALiBi slopes for positional bias. Defaults to None.
         deterministic (bool, optional): Whether to use deterministic algorithms. Defaults to False.
+        time_event (Optional[torch.cuda.Event], optional): CUDA event for timing or synchronization. Defaults to None.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: A tuple containing the gradients with respect to
@@ -344,7 +345,7 @@ def llama_flash_attn_backward(
             comm.all_gather(kv_buffer_copy[0], send_k)
             comm.all_gather(kv_buffer_copy[1], send_v)
 
-        # kv_buffer[0] has shape (batch_k, seq_k, world_size, heads_k_stride, head_dim)
+        # kv_buffer[0] has shape (world_size, batch_k, seq_k, heads_k_stride, head_dim)
         # We want k_i to be (batch_k, seq_k * world_size, heads_k_stride, head_dim)
         if causal:
             k_i = kv_buffer[0][:(rank + 1)]
@@ -605,7 +606,7 @@ class LlamaFlashAttnFunc(torch.autograd.Function):
         k = k.contiguous()
         v = v.contiguous()
         # out shape (batch, seq, heads, head_dim)
-        # softmax_lse shape (batch, seq, heads)
+        # softmax_lse shape (batch, heads, seq)
         out, softmax_lse = llama_flash_attn_forward(
             group,
             q,
@@ -914,7 +915,7 @@ class ConditionalLlamaFlashAttnFunc(torch.autograd.Function):
                 "v": v,
                 "dropout_p": dropout_p,
                 "softmax_scale": softmax_scale,
-                "causal": causal, # 'step' was not defined in this scope
+                "causal": causal,
                 "window_size_left": window_size[0],
                 "window_size_right": window_size[1],
                 "softcap": 0.0,
@@ -930,7 +931,7 @@ class ConditionalLlamaFlashAttnFunc(torch.autograd.Function):
                 out, softmax_lse, _, _ = outputs
         else:
             # out shape (batch, seq, heads, head_dim)
-            # softmax_lse shape (batch, seq, heads)
+            # softmax_lse shape (batch, heads, seq)
             out, softmax_lse = llama_flash_attn_forward(
                 group,
                 q,
@@ -1079,7 +1080,7 @@ class ConditionalLlamaRingFlashAttnFunc(torch.autograd.Function):
                 "v": v,
                 "dropout_p": dropout_p,
                 "softmax_scale": softmax_scale,
-                "causal": causal, # 'step' was not defined in this scope
+                "causal": causal,
                 "window_size_left": window_size[0],
                 "window_size_right": window_size[1],
                 "softcap": 0.0,
@@ -1095,7 +1096,7 @@ class ConditionalLlamaRingFlashAttnFunc(torch.autograd.Function):
                 out, softmax_lse, _, _ = outputs
         else:
             # out shape (batch, seq, heads, head_dim)
-            # softmax_lse shape (batch, seq, heads)
+            # softmax_lse shape (batch, heads, seq)
             out, softmax_lse = llama_flash_attn_forward(
                 group,
                 q,
