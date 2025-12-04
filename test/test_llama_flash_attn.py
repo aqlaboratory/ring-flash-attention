@@ -60,10 +60,9 @@ def main():
     local_lse = lse.chunk(world_size, dim=-1)[rank]
 
     # --- Test Subject: Ring Attention ---
-    # FIX 1: Correct variable name for compilation hook
     fn = llama_flash_attn_func 
     
-    # FIX 2: Removed .squeeze(2). Indexing [:,:,0] results in (B, S, H, D)
+    # local_qkv (B, S, H, D, qkv)
     ring_out, ring_lse, _ = fn(
         local_qkv[:,:,0], 
         local_qkv[:,:,1], 
@@ -101,7 +100,6 @@ def main():
 
     log("local_dqkv", local_dqkv)
     
-    # FIX 3: Correct indexing to compare Q, K, and V specifically
     # Shape is (Batch, Seq, 3, Heads, Dim). We slice dim 2.
     log("dq diff", local_dqkv[:, :, 0] - ring_dqkv[:, :, 0])
     log("dk diff", local_dqkv[:, :, 1] - ring_dqkv[:, :, 1])
@@ -112,6 +110,5 @@ def main():
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "compile":
         torch._dynamo.config.capture_scalar_outputs = True
-        # FIX 1 (continued): Compile the actual function used
         llama_flash_attn_func = torch.compile(llama_flash_attn_func)
     main()
