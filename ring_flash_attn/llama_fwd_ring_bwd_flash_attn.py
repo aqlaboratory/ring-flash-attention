@@ -317,6 +317,7 @@ def llama_flash_attn_backward(
 
     for i in range(0, nheads_k, heads_k_stride):
         # Must zero out because for Causal, we don't write to the entire sequence length
+        # i.e., use buffer up to (rank+1) instead of full sequence
         dkv_buffer.zero_()
 
         q_slice = slice(
