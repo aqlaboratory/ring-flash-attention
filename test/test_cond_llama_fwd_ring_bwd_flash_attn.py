@@ -117,5 +117,5 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "compile":
         torch._dynamo.config.capture_scalar_outputs = True
         # FIX 1 (continued): Compile the actual function used
-        llama_fwd_ring_bwd_flash_attn_func = torch.compile(llama_fwd_ring_bwd_flash_attn_func)
+        cond_llama_fwd_ring_bwd_flash_attn_func = torch.compile(cond_llama_fwd_ring_bwd_flash_attn_func)
     main()
