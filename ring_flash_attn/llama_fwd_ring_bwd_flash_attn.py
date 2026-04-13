@@ -97,10 +97,11 @@ def llama_flash_attn_forward(
         v_0 = v[:, :, :head_first_stride].contiguous()
 
         # Allocate one smaller buffer for the first step
-        kv_buffer_small1 = torch.empty(
-            (2, world_size, batch_k, seq_k, head_first_stride, head_dim),
+        kv_buffer_small1_raw = torch.empty(
+            (world_size, 2, batch_k, seq_k, head_first_stride, head_dim),
             dtype=k.dtype, device=k.device
         )
+        kv_buffer_small1 = kv_buffer_small1_raw.transpose(0, 1)
         # Allocate a second buffer for the second, non-standard step
         kv_buffer_small2 = torch.empty(
             (2, world_size, batch_k, seq_k, heads_k_stride - head_first_stride, head_dim),
@@ -116,8 +117,12 @@ def llama_flash_attn_forward(
 
     comm = Comm(process_group)
     # Pass the main tensor slices to all_gather
-    comm.all_gather(initial_kv_buffer[0], k_0)
-    comm.all_gather(initial_kv_buffer[1], v_0)
+    if head_first_stride is not None:
+        send_kv_0 = torch.stack([k_0, v_0], dim=0).contiguous()
+        comm.all_gather(kv_buffer_small1_raw, send_kv_0)
+    else:
+        comm.all_gather(initial_kv_buffer[0], k_0)
+        comm.all_gather(initial_kv_buffer[1], v_0)
 
     current_head = 0
     for step, stride in enumerate(stride_pattern):
@@ -181,8 +186,8 @@ def llama_flash_attn_forward(
             k_i = rearrange(k_i, 'w b s hs dh -> b (w s) hs dh')
             v_i = rearrange(v_i, 'w b s hs dh -> b (w s) hs dh')
         else:
-            k_i = rearrange(current_kv_buffer[0], "w b s hs dh -> b (w s) hs dh")
-            v_i = rearrange(current_kv_buffer[1], "w b s hs dh -> b (w s) hs dh")
+            k_i = rearrange(current_kv_buffer[0].contiguous(), "w b s hs dh -> b (w s) hs dh")
+            v_i = rearrange(current_kv_buffer[1].contiguous(), "w b s hs dh -> b (w s) hs dh")
 
         # params = get_default_args(_flash_attn_varlen_forward).copy()
         params = {
