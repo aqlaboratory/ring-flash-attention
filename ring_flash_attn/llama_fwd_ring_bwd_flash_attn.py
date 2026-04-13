@@ -96,11 +96,13 @@ def llama_flash_attn_forward(
         k_0 = k[:, :, :head_first_stride].contiguous()
         v_0 = v[:, :, :head_first_stride].contiguous()
 
-        # Allocate one smaller buffer for the first step
+        # Allocate one smaller buffer for the first step. 
+        # world_size is first to match NCCL's physical gathered memory layout.
         kv_buffer_small1_raw = torch.empty(
             (world_size, 2, batch_k, seq_k, head_first_stride, head_dim),
             dtype=k.dtype, device=k.device
         )
+        # Transpose to create a view matching the expected (2, world_size, ...) layout
         kv_buffer_small1 = kv_buffer_small1_raw.transpose(0, 1)
         # Allocate a second buffer for the second, non-standard step
         kv_buffer_small2 = torch.empty(
@@ -118,7 +120,9 @@ def llama_flash_attn_forward(
     comm = Comm(process_group)
     # Pass the main tensor slices to all_gather
     if head_first_stride is not None:
+        # Pack k_0 and v_0 to reduce NCCL launch overhead for the small first chunk
         send_kv_0 = torch.stack([k_0, v_0], dim=0).contiguous()
+        # Gather directly into the NCCL-aligned raw buffer
         comm.all_gather(kv_buffer_small1_raw, send_kv_0)
     else:
         comm.all_gather(initial_kv_buffer[0], k_0)
