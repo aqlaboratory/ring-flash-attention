@@ -12,6 +12,8 @@ tests=(
   test_stripe_flash_attn_func.py
   test_zigzag_ring_flash_attn_func.py
   test_zigzag_ring_flash_attn_varlen_func.py
+  test_cond_llama_fwd_ring_bwd_flash_attn.py
+  test_pack_first_stride.py
 )
 
 for test in "${tests[@]}"; do
