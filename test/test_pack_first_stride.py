@@ -1,7 +1,6 @@
 import sys
 import torch
 import torch.distributed as dist
-from flash_attn import flash_attn_qkvpacked_func
 from ring_flash_attn.llama_fwd_ring_bwd_flash_attn import llama_fwd_ring_bwd_flash_attn_func
 from utils import log, set_seed
 
