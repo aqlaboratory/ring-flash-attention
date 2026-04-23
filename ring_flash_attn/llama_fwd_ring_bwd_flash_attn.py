@@ -34,6 +34,7 @@ def llama_flash_attn_forward(
     alibi_slopes: Optional[torch.Tensor] = None,
     deterministic: bool = False,
     head_first_stride: Optional[int] = None,
+    pack_first_stride: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Llama-style flash attention forward pass with ring communication.
@@ -57,6 +58,8 @@ def llama_flash_attn_forward(
         deterministic (bool, optional): Whether to use deterministic algorithms. Defaults to False.
         head_first_stride (Optional[int], optional): A different (smaller) stride for the first group of heads.
             This is an optimization to increase communication/computation overlap. Defaults to None.
+        pack_first_stride (bool, optional): Whether to pack the first stride of key and value 
+            into a single all_gather to reduce overhead. Defaults to True.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
@@ -96,14 +99,20 @@ def llama_flash_attn_forward(
         k_0 = k[:, :, :head_first_stride].contiguous()
         v_0 = v[:, :, :head_first_stride].contiguous()
 
-        # Allocate one smaller buffer for the first step. 
-        # world_size is first to match NCCL's physical gathered memory layout.
-        kv_buffer_small1_raw = torch.empty(
-            (world_size, 2, batch_k, seq_k, head_first_stride, head_dim),
-            dtype=k.dtype, device=k.device
-        )
-        # Transpose to create a view matching the expected (2, world_size, ...) layout
-        kv_buffer_small1 = kv_buffer_small1_raw.transpose(0, 1)
+        if pack_first_stride:
+            # Allocate one smaller buffer for the first step. 
+            # world_size is first to match NCCL's physical gathered memory layout.
+            kv_buffer_small1_raw = torch.empty(
+                (world_size, 2, batch_k, seq_k, head_first_stride, head_dim),
+                dtype=k.dtype, device=k.device
+            )
+            # Transpose to create a view matching the expected (2, world_size, ...) layout
+            kv_buffer_small1 = kv_buffer_small1_raw.transpose(0, 1)
+        else:
+            kv_buffer_small1 = torch.empty(
+                (2, world_size, batch_k, seq_k, head_first_stride, head_dim),
+                dtype=k.dtype, device=k.device
+            )
         # Allocate a second buffer for the second, non-standard step
         kv_buffer_small2 = torch.empty(
             (2, world_size, batch_k, seq_k, heads_k_stride - head_first_stride, head_dim),
@@ -119,7 +128,7 @@ def llama_flash_attn_forward(
 
     comm = Comm(process_group)
     # Pass the main tensor slices to all_gather
-    if head_first_stride is not None:
+    if head_first_stride is not None and pack_first_stride:
         # Pack k_0 and v_0 to reduce NCCL launch overhead for the small first chunk
         send_kv_0 = torch.stack([k_0, v_0], dim=0).contiguous()
         # Gather directly into the NCCL-aligned raw buffer
@@ -448,6 +457,7 @@ class LlamaRingFlashAttnFunc(torch.autograd.Function):
         v: torch.Tensor,
         heads_k_stride: int,
         head_first_stride: Optional[int],
+        pack_first_stride: bool,
         dropout_p: float,
         softmax_scale: Optional[float],
         causal: bool,
@@ -471,6 +481,7 @@ class LlamaRingFlashAttnFunc(torch.autograd.Function):
             v (torch.Tensor): Value tensor.
             heads_k_stride (int): Stride for key/value heads in GQA/MQA.
             head_first_stride (Optional[int]): A different stride for the first group of heads.
+            pack_first_stride (bool): Whether to pack the first stride of key and value.
             dropout_p (float): Dropout probability.
             softmax_scale (Optional[float]): Scale factor for softmax. If None, calculated from head dimension.
             causal (bool): Whether to apply causal masking.
@@ -499,6 +510,7 @@ class LlamaRingFlashAttnFunc(torch.autograd.Function):
             v,
             heads_k_stride=heads_k_stride,
             head_first_stride=head_first_stride,
+            pack_first_stride=pack_first_stride,
             softmax_scale=softmax_scale,
             dropout_p=dropout_p,
             causal=causal,
@@ -558,8 +570,8 @@ class LlamaRingFlashAttnFunc(torch.autograd.Function):
         )
         if ctx.bwd_event_sync:
             time_event.synchronize()
-        # forward takes 14 args excluding ctx. return 3 grad + 11 None
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None
+        # forward takes 15 args excluding ctx. return 3 grad + 12 None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None
 
 class LlamaFlashAttnFunc(torch.autograd.Function):
     """
@@ -573,6 +585,7 @@ class LlamaFlashAttnFunc(torch.autograd.Function):
         v: torch.Tensor,
         heads_k_stride: int,
         head_first_stride: Optional[int],
+        pack_first_stride: bool,
         dropout_p: float,
         softmax_scale: Optional[float],
         causal: bool,
@@ -596,6 +609,7 @@ class LlamaFlashAttnFunc(torch.autograd.Function):
             v (torch.Tensor): Value tensor.
             heads_k_stride (int): Stride for key/value heads in GQA/MQA.
             head_first_stride (Optional[int]): A different stride for the first group of heads.
+            pack_first_stride (bool): Whether to pack the first stride of key and value.
             dropout_p (float): Dropout probability.
             softmax_scale (Optional[float]): Scale factor for softmax. If None, calculated from head dimension.
             causal (bool): Whether to apply causal masking.
@@ -624,6 +638,7 @@ class LlamaFlashAttnFunc(torch.autograd.Function):
             v,
             heads_k_stride=heads_k_stride,
             head_first_stride=head_first_stride,
+            pack_first_stride=pack_first_stride,
             softmax_scale=softmax_scale,
             dropout_p=dropout_p,
             causal=causal,
@@ -668,8 +683,8 @@ class LlamaFlashAttnFunc(torch.autograd.Function):
         )
         if ctx.bwd_event_sync:
             time_event.synchronize()
-        # forward takes 14 args excluding ctx. return 3 grad + 11 None
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None
+        # forward takes 15 args excluding ctx. return 3 grad + 12 None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 def llama_fwd_ring_bwd_flash_attn_func(
@@ -678,6 +693,7 @@ def llama_fwd_ring_bwd_flash_attn_func(
     v: torch.Tensor,
     heads_k_stride: int = 1,
     head_first_stride: Optional[int] = None,
+    pack_first_stride: bool = True,
     dropout_p: float = 0.0,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
@@ -705,6 +721,8 @@ def llama_fwd_ring_bwd_flash_attn_func(
         head_first_stride (Optional[int], optional): A different stride for the first group of heads
             to improve communication/computation overlap. Defaults to None. 
             Must be smaller than heads_k_stride.
+        pack_first_stride (bool, optional): Whether to pack the first stride of key and value 
+            into a single all_gather to reduce overhead. Defaults to True.
         dropout_p (float, optional): Dropout probability. Defaults to 0.0.
         softmax_scale (Optional[float], optional): The scale factor for softmax. If None, it is
             calculated as `1.0 / sqrt(head_dim)`. Defaults to None.
@@ -730,6 +748,7 @@ def llama_fwd_ring_bwd_flash_attn_func(
         v,
         heads_k_stride,
         head_first_stride,
+        pack_first_stride,
         dropout_p,
         softmax_scale,
         causal,
@@ -747,6 +766,7 @@ def llama_flash_attn_func(
     v: torch.Tensor,
     heads_k_stride: int = 1,
     head_first_stride: Optional[int] = None,
+    pack_first_stride: bool = True,
     dropout_p: float = 0.0,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
@@ -764,6 +784,7 @@ def llama_flash_attn_func(
         v,
         heads_k_stride,
         head_first_stride,
+        pack_first_stride,
         dropout_p,
         softmax_scale,
         causal,
@@ -873,6 +894,7 @@ class ConditionalLlamaFlashAttnFunc(torch.autograd.Function):
         v: torch.Tensor,
         heads_k_stride: int,
         head_first_stride: Optional[int],
+        pack_first_stride: bool,
         dropout_p: float,
         softmax_scale: Optional[float],
         causal: bool,
@@ -897,6 +919,7 @@ class ConditionalLlamaFlashAttnFunc(torch.autograd.Function):
             v (torch.Tensor): Value tensor.
             heads_k_stride (int): Stride for key/value heads in GQA/MQA.
             head_first_stride (Optional[int]): A different stride for the first group of heads.
+            pack_first_stride (bool): Whether to pack the first stride of key and value.
             dropout_p (float): Dropout probability.
             softmax_scale (Optional[float]): Scale factor for softmax. If None, calculated from head dimension.
             causal (bool): Whether to apply causal masking.
@@ -949,6 +972,7 @@ class ConditionalLlamaFlashAttnFunc(torch.autograd.Function):
                 v,
                 heads_k_stride=heads_k_stride,
                 head_first_stride=head_first_stride,
+                pack_first_stride=pack_first_stride,
                 softmax_scale=softmax_scale,
                 dropout_p=dropout_p,
                 causal=causal,
@@ -1022,8 +1046,8 @@ class ConditionalLlamaFlashAttnFunc(torch.autograd.Function):
             )
         if ctx.bwd_event_sync:
             time_event.synchronize()
-        # forward takes 14 args excluding ctx. return 3 grad + 11 None
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None
+        # forward takes 15 args excluding ctx. return 3 grad + 12 None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 class ConditionalLlamaRingFlashAttnFunc(torch.autograd.Function):
@@ -1038,6 +1062,7 @@ class ConditionalLlamaRingFlashAttnFunc(torch.autograd.Function):
         v: torch.Tensor,
         heads_k_stride: int,
         head_first_stride: Optional[int],
+        pack_first_stride: bool,
         dropout_p: float,
         softmax_scale: Optional[float],
         causal: bool,
@@ -1062,6 +1087,7 @@ class ConditionalLlamaRingFlashAttnFunc(torch.autograd.Function):
             v (torch.Tensor): Value tensor.
             heads_k_stride (int): Stride for key/value heads in GQA/MQA.
             head_first_stride (Optional[int]): A different stride for the first group of heads.
+            pack_first_stride (bool): Whether to pack the first stride of key and value.
             dropout_p (float): Dropout probability.
             softmax_scale (Optional[float]): Scale factor for softmax. If None, calculated from head dimension.
             causal (bool): Whether to apply causal masking.
@@ -1114,6 +1140,7 @@ class ConditionalLlamaRingFlashAttnFunc(torch.autograd.Function):
                 v,
                 heads_k_stride=heads_k_stride,
                 head_first_stride=head_first_stride,
+                pack_first_stride=pack_first_stride,
                 softmax_scale=softmax_scale,
                 dropout_p=dropout_p,
                 causal=causal,
@@ -1149,6 +1176,7 @@ def cond_llama_fwd_ring_bwd_flash_attn_func(
     v: torch.Tensor,
     heads_k_stride: int = 1,
     head_first_stride: Optional[int] = None,
+    pack_first_stride: bool = True,
     dropout_p: float = 0.0,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
@@ -1173,6 +1201,7 @@ def cond_llama_fwd_ring_bwd_flash_attn_func(
         v (torch.Tensor): Value tensor.
         heads_k_stride (int, optional): Stride for key/value heads. Defaults to 1.
         head_first_stride (Optional[int], optional): Different stride for the first group of heads. Defaults to None.
+        pack_first_stride (bool, optional): Whether to pack the first stride of key and value. Defaults to True.
         dropout_p (float, optional): Dropout probability. Defaults to 0.0.
         softmax_scale (Optional[float], optional): Softmax scale factor. Defaults to None.
         causal (bool, optional): Whether to apply causal masking. Defaults to False.
@@ -1192,6 +1221,7 @@ def cond_llama_fwd_ring_bwd_flash_attn_func(
         v,
         heads_k_stride,
         head_first_stride,
+        pack_first_stride,
         dropout_p,
         softmax_scale,
         causal,
@@ -1210,6 +1240,7 @@ def cond_llama_flash_attn_func(
     v: torch.Tensor,
     heads_k_stride: int = 1,
     head_first_stride: Optional[int] = None,
+    pack_first_stride: bool = True,
     dropout_p: float = 0.0,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
@@ -1231,6 +1262,7 @@ def cond_llama_flash_attn_func(
         v,
         heads_k_stride,
         head_first_stride,
+        pack_first_stride,
         dropout_p,
         softmax_scale,
         causal,
