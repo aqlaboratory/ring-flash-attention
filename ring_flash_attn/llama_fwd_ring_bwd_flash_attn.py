@@ -930,6 +930,7 @@ class ConditionalLlamaFlashAttnFunc(torch.autograd.Function):
             else:
                 assert len(outputs) == 4
                 out, softmax_lse, _, _ = outputs
+            ctx.bwd_event_sync = False
         else:
             # out shape (batch, seq, heads, head_dim)
             # softmax_lse shape (batch, heads, seq)
@@ -947,6 +948,7 @@ class ConditionalLlamaFlashAttnFunc(torch.autograd.Function):
                 alibi_slopes=alibi_slopes,
                 deterministic=False,
             )
+            ctx.bwd_event_sync = bwd_event_sync
         ctx.save_for_backward(q, k, v, out, softmax_lse)
         ctx.dropout_p = dropout_p
         ctx.softmax_scale = softmax_scale
@@ -955,7 +957,6 @@ class ConditionalLlamaFlashAttnFunc(torch.autograd.Function):
         ctx.alibi_slopes = alibi_slopes
         ctx.deterministic = deterministic
         ctx.group = group
-        ctx.bwd_event_sync = bwd_event_sync
         ctx.heads_k_stride = heads_k_stride
         return out if not return_softmax else (out, softmax_lse, None)
 
@@ -1095,6 +1096,7 @@ class ConditionalLlamaRingFlashAttnFunc(torch.autograd.Function):
             else:
                 assert len(outputs) == 4
                 out, softmax_lse, _, _ = outputs
+            ctx.bwd_event_sync = False
         else:
             # out shape (batch, seq, heads, head_dim)
             # softmax_lse shape (batch, heads, seq)
@@ -1112,6 +1114,7 @@ class ConditionalLlamaRingFlashAttnFunc(torch.autograd.Function):
                 alibi_slopes=alibi_slopes,
                 deterministic=False,
             )
+            ctx.bwd_event_sync = bwd_event_sync
         ctx.save_for_backward(q, k, v, out, softmax_lse)
         ctx.dropout_p = dropout_p
         ctx.softmax_scale = softmax_scale
@@ -1120,7 +1123,6 @@ class ConditionalLlamaRingFlashAttnFunc(torch.autograd.Function):
         ctx.alibi_slopes = alibi_slopes
         ctx.deterministic = deterministic
         ctx.group = group
-        ctx.bwd_event_sync = bwd_event_sync
         ctx.heads_k_stride = heads_k_stride
         return out if not return_softmax else (out, softmax_lse, None)
 
