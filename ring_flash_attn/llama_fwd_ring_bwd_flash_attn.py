@@ -897,6 +897,7 @@ class ConditionalLlamaFlashAttnFunc(torch.autograd.Function):
             return_softmax (bool): Whether to return the softmax log-sum-exp.
             group (dist.ProcessGroup): The distributed process group.
             bwd_event_sync (bool): If True, syncs a CUDA event in the backward pass to control memory allocation.
+                Only applicable when group is not None.
 
         Returns:
             Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, None]]: The attention output, and optionally the LSE and a None placeholder.
@@ -1063,6 +1064,7 @@ class ConditionalLlamaRingFlashAttnFunc(torch.autograd.Function):
             return_softmax (bool): Whether to return the softmax log-sum-exp.
             group (dist.ProcessGroup): The distributed process group.
             bwd_event_sync (bool): If True, syncs a CUDA event in the backward pass to control memory allocation.
+                Only applicable when group is not None.
 
         Returns:
             Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, None]]: The attention output, and optionally the LSE and a None placeholder.
