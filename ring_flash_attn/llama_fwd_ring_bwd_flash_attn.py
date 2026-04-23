@@ -58,8 +58,9 @@ def llama_flash_attn_forward(
         deterministic (bool, optional): Whether to use deterministic algorithms. Defaults to False.
         head_first_stride (Optional[int], optional): A different (smaller) stride for the first group of heads.
             This is an optimization to increase communication/computation overlap. Defaults to None.
-        pack_first_stride (bool, optional): Whether to pack the first stride of key and value 
-            into a single all_gather to reduce overhead. Defaults to True.
+        pack_first_stride (bool, optional): Whether to pack the first stride of key and value
+            into a single all_gather to reduce overhead when `head_first_stride` is not None.
+            Has no effect if `head_first_stride` is None. Defaults to True.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
