@@ -298,23 +298,28 @@ def llama_flash_attn_backward(
     )
     kv_buffer_copy = torch.empty_like(kv_buffer)
 
-    # Buffer for gradients coming OUT of Flash Attention
+    # Buffer for gradients coming OUT of Flash Attention.
     # Shape: [Batch, Seq * WorldSize, Heads, HeadDim]
+    # Use float32 so that the gradients written by flash_attn backward retain full precision
+    # before the reduce_scatter accumulation step. Using k.dtype (bf16/fp16) here would
+    # quantize each per-rank gradient to low precision before the cross-rank summation.
+    # Note: this doubles the memory of this buffer vs. k.dtype.
     dkv_buffer = torch.empty(
         (2, batch_k, seq_k * world_size, heads_k_stride, head_dim),
-        dtype=k.dtype,
+        dtype=torch.float32,
         device=k.device,
-    ) 
+    )
 
-    # Buffer for input to reduce_scatter (Needs to be rank-contiguous)
+    # Contiguous staging buffer for reduce_scatter input.
+    # reduce_scatter_tensor requires a contiguous tensor; dkv_buffer's permuted view is not.
+    # Both this and dkv_buffer are float32, so the copy_ is lossless.
     scatter_input_buffer = torch.empty(
         (2, world_size, batch_k, seq_k, heads_k_stride, head_dim),
         dtype=torch.float32,
         device=k.device,
     )
 
-    # Buffer for output of reduce_scatter (Float32 for stability)
-    # We use this regardless of stride since dk.float() would require full copies
+    # Buffer for output of reduce_scatter (float32 for numerical stability of the cross-rank sum)
     dkv_reduce_output_buffer = torch.empty(
         (2, batch_k, seq_k, heads_k_stride, head_dim),
         dtype=torch.float32,
