@@ -300,26 +300,24 @@ def llama_flash_attn_backward(
 
     # Buffer for gradients coming OUT of Flash Attention.
     # Shape: [Batch, Seq * WorldSize, Heads, HeadDim]
-    # Use float32 so that the gradients written by flash_attn backward retain full precision
-    # before the reduce_scatter accumulation step. Using k.dtype (bf16/fp16) here would
-    # quantize each per-rank gradient to low precision before the cross-rank summation.
-    # Note: this doubles the memory of this buffer vs. k.dtype.
+    # Must match k.dtype: flash_attn backward requires dk/dv to have the same dtype as k/v.
     dkv_buffer = torch.empty(
         (2, batch_k, seq_k * world_size, heads_k_stride, head_dim),
-        dtype=torch.float32,
+        dtype=k.dtype,
         device=k.device,
     )
 
-    # Contiguous staging buffer for reduce_scatter input.
-    # reduce_scatter_tensor requires a contiguous tensor; dkv_buffer's permuted view is not.
-    # Both this and dkv_buffer are float32, so the copy_ is lossless.
+    # Contiguous fp32 staging buffer for reduce_scatter input.
+    # Two purposes: (1) reduce_scatter_tensor requires a contiguous tensor, and
+    # dkv_buffer's permuted view is not contiguous; (2) the copy_ upcasts from
+    # k.dtype (bf16/fp16) to fp32 so the cross-rank summation is done in full precision.
     scatter_input_buffer = torch.empty(
         (2, world_size, batch_k, seq_k, heads_k_stride, head_dim),
         dtype=torch.float32,
         device=k.device,
     )
 
-    # Buffer for output of reduce_scatter (float32 for numerical stability of the cross-rank sum)
+    # Buffer for output of reduce_scatter (fp32, matching scatter_input_buffer)
     dkv_reduce_output_buffer = torch.empty(
         (2, batch_k, seq_k, heads_k_stride, head_dim),
         dtype=torch.float32,
@@ -424,6 +422,7 @@ def llama_flash_attn_backward(
         grad_view = dkv_buffer.view(2, batch_k, world_size, seq_k, heads_k_stride, head_dim)
         # 2. Permute: Swap B and W. Shape: [2, W, B, S, H, D]
         grad_permuted = grad_view.permute(0, 2, 1, 3, 4, 5)
+        # if scatter_input_buffer in fp32, precision gets promoted
         scatter_input_buffer.copy_(grad_permuted)
 
         # dist.reduce_scatter_tensor concat, gather, reduce on dim=0
