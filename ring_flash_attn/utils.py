@@ -170,6 +170,8 @@ class AllGatherComm:
 
 class ReduceScatterHandleManager:
     def __init__(self, group=None):
+        if group is None:
+            group = dist.distributed_c10d._get_default_group()
         self.group = group
         self._world_size = dist.get_world_size(group)
         self._group_name = group.group_name
