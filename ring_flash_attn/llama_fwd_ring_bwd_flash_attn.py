@@ -254,13 +254,23 @@ def llama_flash_attn_backward(
     softcap=0.0,
     alibi_slopes=None,
     deterministic=False,
+    head_first_stride: Optional[int] = None,
+    head_last_stride: Optional[int] = None,
     time_event=None,
 ):
     """
     Llama-style flash attention backward pass.
 
     This function performs the backward pass of attention, distributing the key and value tensors
-    across a process group using all-gather operations.
+    across a process group using all-gather operations and aggregating dk/dv via reduce_scatter.
+
+    Communication is overlapped with compute on both ends:
+    - The first iteration's all_gather can be shrunk via `head_first_stride` (mirroring forward),
+      splitting the first chunk into [head_first_stride, heads_k_stride - head_first_stride].
+    - The last iteration's reduce_scatter can be shrunk via `head_last_stride`, splitting the
+      last chunk into [heads_k_stride - head_last_stride, head_last_stride].
+    - All interior reduce_scatters run async and overlap with the next iteration's
+      flash_attn_backward; only the final, optionally smaller, reduce_scatter is exposed.
 
     Args:
         process_group (dist.ProcessGroup): The distributed process group for communication.
@@ -278,6 +288,10 @@ def llama_flash_attn_backward(
         softcap (float, optional): Softcap for attention scores. Defaults to 0.0.
         alibi_slopes (Optional[torch.Tensor], optional): ALiBi slopes for positional bias. Defaults to None.
         deterministic (bool, optional): Whether to use deterministic algorithms. Defaults to False.
+        head_first_stride (Optional[int], optional): Smaller stride for the first iteration to reduce
+            the size of the un-overlapped initial all_gather. Must be in (0, heads_k_stride). Defaults to None.
+        head_last_stride (Optional[int], optional): Smaller stride for the last iteration to reduce
+            the size of the un-overlapped final reduce_scatter. Must be in (0, heads_k_stride). Defaults to None.
         time_event (Optional[torch.cuda.Event], optional): CUDA event for timing or synchronization. Defaults to None.
 
     Returns:
@@ -290,60 +304,172 @@ def llama_flash_attn_backward(
 
     world_size = dist.get_world_size(process_group)
     rank = dist.get_rank(process_group)
-    
-    kv_buffer = torch.empty(
-        (2, world_size, batch_k, seq_k, heads_k_stride, head_dim),
-        dtype=k.dtype,
-        device=k.device,
-    )
-    kv_buffer_copy = torch.empty_like(kv_buffer)
 
-    # Buffer for gradients coming OUT of Flash Attention.
-    # Shape: [Batch, Seq * WorldSize, Heads, HeadDim]
-    # Must match k.dtype: flash_attn backward requires dk/dv to have the same dtype as k/v.
-    dkv_buffer = torch.empty(
-        (2, batch_k, seq_k * world_size, heads_k_stride, head_dim),
-        dtype=k.dtype,
-        device=k.device,
+    # ---- Build stride pattern (mirrors forward, extended for the tail) ----
+    n_full = nheads_k // heads_k_stride
+    if head_first_stride is not None:
+        assert 0 < head_first_stride < heads_k_stride, (
+            "head_first_stride must be between 0 and heads_k_stride"
+        )
+        first_part = [head_first_stride, heads_k_stride - head_first_stride]
+        n_full -= 1
+    else:
+        first_part = []
+
+    if head_last_stride is not None:
+        assert 0 < head_last_stride < heads_k_stride, (
+            "head_last_stride must be between 0 and heads_k_stride"
+        )
+        last_part = [heads_k_stride - head_last_stride, head_last_stride]
+        n_full -= 1
+    else:
+        last_part = []
+
+    assert n_full >= 0, (
+        f"nheads_k={nheads_k}, heads_k_stride={heads_k_stride} too small to fit "
+        f"both head_first_stride and head_last_stride splits"
     )
 
-    # Contiguous fp32 staging buffer for reduce_scatter input.
-    # Two purposes: (1) reduce_scatter_tensor requires a contiguous tensor, and
-    # dkv_buffer's permuted view is not contiguous; (2) the copy_ upcasts from
-    # k.dtype (bf16/fp16) to fp32 so the cross-rank summation is done in full precision.
-    scatter_input_buffer = torch.empty(
-        (2, world_size, batch_k, seq_k, heads_k_stride, head_dim),
-        dtype=torch.float32,
-        device=k.device,
-    )
+    stride_pattern = first_part + [heads_k_stride] * n_full + last_part
+    n_steps = len(stride_pattern)
+    head_offsets = []
+    cur = 0
+    for s in stride_pattern:
+        head_offsets.append(cur)
+        cur += s
 
-    # Buffer for output of reduce_scatter (fp32, matching scatter_input_buffer)
-    dkv_reduce_output_buffer = torch.empty(
-        (2, batch_k, seq_k, heads_k_stride, head_dim),
-        dtype=torch.float32,
-        device=k.device,
-    )
-    
+    n_first = len(first_part)
+    n_last = len(last_part)
+    middle_start = n_first
+    middle_end = n_steps - n_last  # exclusive
+
+    def is_dedicated_step(step):
+        return step < middle_start or step >= middle_end
+
+    # ---- Buffer allocations ----
+    def kv_shape(width):
+        return (2, world_size, batch_k, seq_k, width, head_dim)
+
+    def dkv_shape(width):
+        return (2, batch_k, seq_k * world_size, width, head_dim)
+
+    def scatter_in_shape(width):
+        return (2, world_size, batch_k, seq_k, width, head_dim)
+
+    def reduce_out_shape(width):
+        return (2, batch_k, seq_k, width, head_dim)
+
+    # KV all_gather destinations: dedicated buffers for first/last small steps,
+    # double-buffered swap pair (kv_buf_main / kv_buf_copy) shared across middle steps.
+    kv_bufs_per_step = [None] * n_steps
+    if n_first >= 1:
+        kv_bufs_per_step[0] = torch.empty(
+            kv_shape(head_first_stride), dtype=k.dtype, device=k.device
+        )
+        kv_bufs_per_step[1] = torch.empty(
+            kv_shape(heads_k_stride - head_first_stride), dtype=k.dtype, device=k.device
+        )
+    if n_last >= 1:
+        kv_bufs_per_step[n_steps - 2] = torch.empty(
+            kv_shape(heads_k_stride - head_last_stride), dtype=k.dtype, device=k.device
+        )
+        kv_bufs_per_step[n_steps - 1] = torch.empty(
+            kv_shape(head_last_stride), dtype=k.dtype, device=k.device
+        )
+
+    if middle_end > middle_start:
+        kv_buf_main = torch.empty(kv_shape(heads_k_stride), dtype=k.dtype, device=k.device)
+        kv_buf_copy = torch.empty(kv_shape(heads_k_stride), dtype=k.dtype, device=k.device)
+    else:
+        kv_buf_main = None
+        kv_buf_copy = None
+
+    # flash_attn_backward writes to a width-specific dkv_buffer (k.dtype, since FA requires it).
+    # One per unique width is enough — flash_attn_backward is sync, so we don't pipeline its writes.
+    unique_widths = set(stride_pattern)
+    dkv_buf_by_width = {
+        w: torch.empty(dkv_shape(w), dtype=k.dtype, device=k.device)
+        for w in unique_widths
+    }
+
+    # Reduce_scatter staging buffers (fp32 for cross-rank precision).
+    # Two slots per width to ping-pong while the previous reduce_scatter is in flight.
+    scatter_in_slots = {
+        w: [
+            torch.empty(scatter_in_shape(w), dtype=torch.float32, device=k.device)
+            for _ in range(2)
+        ]
+        for w in unique_widths
+    }
+    reduce_out_slots = {
+        w: [
+            torch.empty(reduce_out_shape(w), dtype=torch.float32, device=k.device)
+            for _ in range(2)
+        ]
+        for w in unique_widths
+    }
+    next_slot_by_width = {w: 0 for w in unique_widths}
+
     dq = torch.empty_like(q)
     dk = torch.empty_like(k)
     dv = torch.empty_like(v)
 
     comm = Comm(process_group)
 
-    k_0 = k[:, :, :heads_k_stride].contiguous()
-    v_0 = v[:, :, :heads_k_stride].contiguous()
+    # ---- Initial all_gather for step 0 ----
+    first_stride_size = stride_pattern[0]
+    k_0 = k[:, :, :first_stride_size].contiguous()
+    v_0 = v[:, :, :first_stride_size].contiguous()
+    if is_dedicated_step(0):
+        first_dst = kv_bufs_per_step[0]
+    else:
+        # step 0 is the first middle step → gather directly into kv_buf_main (no swap on read)
+        first_dst = kv_buf_main
+    comm.all_gather(first_dst[0], k_0)
+    comm.all_gather(first_dst[1], v_0)
 
-    # Pass the main tensor slices to all_gather
-    comm.all_gather(kv_buffer_copy[0], k_0)
-    comm.all_gather(kv_buffer_copy[1], v_0)
+    # ---- Pipeline state: previous iteration's in-flight reduce_scatter ----
+    prev_handles = None  # (handle_dk, handle_dv, slot, i, stride_w)
 
-    for i in range(0, nheads_k, heads_k_stride):
-        # Must zero out because for Causal, we don't write to the entire sequence length
-        # i.e., use buffer up to (rank+1) instead of full sequence
-        dkv_buffer.zero_()
+    for step, (i, stride_i) in enumerate(zip(head_offsets, stride_pattern)):
+        comm.wait()
 
+        # Select buffer that holds THIS step's gathered K/V.
+        if is_dedicated_step(step):
+            current_kv_buf = kv_bufs_per_step[step]
+        elif step == middle_start:
+            # First middle step: data was gathered directly into kv_buf_main (initial gather
+            # if n_first == 0, else by the prior step's "next" gather targeting kv_buf_main).
+            current_kv_buf = kv_buf_main
+        else:
+            # Subsequent middle step: standard double-buffer swap.
+            kv_buf_main, kv_buf_copy = kv_buf_copy, kv_buf_main
+            current_kv_buf = kv_buf_main
+
+        # Issue the NEXT step's all_gather.
+        if step < n_steps - 1:
+            next_step = step + 1
+            next_stride = stride_pattern[next_step]
+            kv_slice_left = i + stride_i
+            kv_slice_right = kv_slice_left + next_stride
+            send_k = k[:, :, kv_slice_left:kv_slice_right].contiguous()
+            send_v = v[:, :, kv_slice_left:kv_slice_right].contiguous()
+
+            if is_dedicated_step(next_step):
+                next_dst = kv_bufs_per_step[next_step]
+            elif next_step == middle_start:
+                # Gather into kv_buf_main so the first middle step reads it without swapping.
+                next_dst = kv_buf_main
+            else:
+                # Gather into kv_buf_copy; the swap on next iteration will expose it.
+                next_dst = kv_buf_copy
+
+            comm.all_gather(next_dst[0], send_k)
+            comm.all_gather(next_dst[1], send_v)
+
+        # ---- flash_attn_backward ----
         q_slice = slice(
-            i * nheads // nheads_k, (i + heads_k_stride) * nheads // nheads_k
+            i * nheads // nheads_k, (i + stride_i) * nheads // nheads_k
         )
         q_i = q[:, :, q_slice]
         dout_i = dout[:, :, q_slice]
@@ -354,91 +480,88 @@ def llama_flash_attn_backward(
         else:
             lse_i = softmax_lse[q_slice]
 
-        comm.wait()
-        # Swap the main storage tensors
-        kv_buffer, kv_buffer_copy = kv_buffer_copy, kv_buffer
-
-        if i < nheads_k - heads_k_stride:
-            # all_gather the next kv slice
-            kv_slice_left = i + heads_k_stride
-            kv_slice_right = kv_slice_left + heads_k_stride
-            send_k = k[:, :, kv_slice_left:kv_slice_right].contiguous()
-            send_v = v[:, :, kv_slice_left:kv_slice_right].contiguous()
-            # Pass the main tensor slices for the next round
-            comm.all_gather(kv_buffer_copy[0], send_k)
-            comm.all_gather(kv_buffer_copy[1], send_v)
-
-        # kv_buffer[0] has shape (world_size, batch_k, seq_k, heads_k_stride, head_dim)
-        # We want k_i to be (batch_k, seq_k * world_size, heads_k_stride, head_dim)
         if causal:
-            k_i = kv_buffer[0][:(rank + 1)]
-            v_i = kv_buffer[1][:(rank + 1)]
+            k_i = current_kv_buf[0][:(rank + 1)]
+            v_i = current_kv_buf[1][:(rank + 1)]
             k_i = rearrange(k_i, 'w b s hs dh -> b (w s) hs dh').contiguous()
             v_i = rearrange(v_i, 'w b s hs dh -> b (w s) hs dh').contiguous()
         else:
-            k_i = rearrange(kv_buffer[0], 'w b s hs dh -> b (w s) hs dh').contiguous()
-            v_i = rearrange(kv_buffer[1], 'w b s hs dh -> b (w s) hs dh').contiguous()
+            k_i = rearrange(current_kv_buf[0], 'w b s hs dh -> b (w s) hs dh').contiguous()
+            v_i = rearrange(current_kv_buf[1], 'w b s hs dh -> b (w s) hs dh').contiguous()
 
+        dkv_buf = dkv_buf_by_width[stride_i]
+        # Zero so the unused (rank+1, world_size) slice contributes 0 to the cross-rank sum.
+        dkv_buf.zero_()
         if causal:
-            # dk must have the same shape as k
-            dk_i = dkv_buffer[0][:, :k_i.shape[1]]
-            dv_i = dkv_buffer[1][:, :k_i.shape[1]]
+            dk_i = dkv_buf[0][:, :k_i.shape[1]]
+            dv_i = dkv_buf[1][:, :k_i.shape[1]]
         else:
-            dk_i = dkv_buffer[0]
-            dv_i = dkv_buffer[1]
+            dk_i = dkv_buf[0]
+            dv_i = dkv_buf[1]
 
-        # params = get_default_args(_flash_attn_varlen_backward).copy()
         params = {
-                "dout": dout_i,
-                "q": q_i,
-                "k": k_i,
-                "v": v_i,
-                "out": out_i,
-                "softmax_lse": lse_i,
-                "dq": dq_i,
-                "dk": dk_i,
-                "dv": dv_i,
-                "dropout_p": dropout_p,
-                "softmax_scale": softmax_scale,
-                "causal": causal,
-                "window_size_left": window_size[0],
-                "window_size_right": window_size[1],
-                "softcap": softcap,
-                "alibi_slopes": alibi_slopes,
-                "deterministic": deterministic,
+            "dout": dout_i,
+            "q": q_i,
+            "k": k_i,
+            "v": v_i,
+            "out": out_i,
+            "softmax_lse": lse_i,
+            "dq": dq_i,
+            "dk": dk_i,
+            "dv": dv_i,
+            "dropout_p": dropout_p,
+            "softmax_scale": softmax_scale,
+            "causal": causal,
+            "window_size_left": window_size[0],
+            "window_size_right": window_size[1],
+            "softcap": softcap,
+            "alibi_slopes": alibi_slopes,
+            "deterministic": deterministic,
         }
         _wrapped_flash_attn_backward(**params)
-
-        # We do not need k_i, v_i, or the slices anymore.
         del k_i, v_i, q_i, dout_i, out_i
 
-        # Target for reduce_scatter is always our FP32 buffer
-        dk_i = dkv_reduce_output_buffer[0]
-        dv_i = dkv_reduce_output_buffer[1]
+        # ---- Drain the previous iteration's async reduce_scatter ----
+        # Done AFTER flash_attn_backward so they overlap on the GPU.
+        if prev_handles is not None:
+            prev_h_dk, prev_h_dv, prev_slot, prev_i, prev_stride_w = prev_handles
+            prev_h_dk.wait()
+            prev_h_dv.wait()
+            prev_out = reduce_out_slots[prev_stride_w][prev_slot]
+            dk[:, :, prev_i:prev_i + prev_stride_w].copy_(prev_out[0])
+            dv[:, :, prev_i:prev_i + prev_stride_w].copy_(prev_out[1])
 
-        # Rearrange dkv_buffer so the first dimension represents the World Rank.
-        # dkv_buffer is [2, B, W*S, H, D]. We need to transform to [2, W, B, S, H, D]
-        # 1. View: Split W*S -> W, S.  Shape: [2, B, W, S, H, D]
-        grad_view = dkv_buffer.view(2, batch_k, world_size, seq_k, heads_k_stride, head_dim)
-        # 2. Permute: Swap B and W. Shape: [2, W, B, S, H, D]
+        # ---- Stage and issue THIS iteration's async reduce_scatter ----
+        # Permute (2, B, W*S, H, D) -> (2, W, B, S, H, D) and upcast to fp32 via copy_.
+        grad_view = dkv_buf.view(2, batch_k, world_size, seq_k, stride_i, head_dim)
         grad_permuted = grad_view.permute(0, 2, 1, 3, 4, 5)
-        # if scatter_input_buffer in fp32, precision gets promoted
-        scatter_input_buffer.copy_(grad_permuted)
 
-        # dist.reduce_scatter_tensor concat, gather, reduce on dim=0
-        dist.reduce_scatter_tensor(dk_i, scatter_input_buffer[0], group=process_group)
-        dist.reduce_scatter_tensor(dv_i, scatter_input_buffer[1], group=process_group)
+        slot = next_slot_by_width[stride_i]
+        next_slot_by_width[stride_i] = 1 - slot
 
-        # Final copy back to main bf16/fp16 tensor
-        if heads_k_stride != nheads_k:
-            dk[:, :, i : i + heads_k_stride].copy_(dk_i)
-            dv[:, :, i : i + heads_k_stride].copy_(dv_i)
-        else:
-            dk.copy_(dk_i)
-            dv.copy_(dv_i)
+        scatter_in = scatter_in_slots[stride_i][slot]
+        reduce_out = reduce_out_slots[stride_i][slot]
+        scatter_in.copy_(grad_permuted)
 
-        if i == 0 and time_event is not None:
+        h_dk = dist.reduce_scatter_tensor(
+            reduce_out[0], scatter_in[0], group=process_group, async_op=True
+        )
+        h_dv = dist.reduce_scatter_tensor(
+            reduce_out[1], scatter_in[1], group=process_group, async_op=True
+        )
+        prev_handles = (h_dk, h_dv, slot, i, stride_i)
+
+        if step == 0 and time_event is not None:
             time_event.record()
+
+    # ---- Drain the final reduce_scatter ----
+    if prev_handles is not None:
+        prev_h_dk, prev_h_dv, prev_slot, prev_i, prev_stride_w = prev_handles
+        prev_h_dk.wait()
+        prev_h_dv.wait()
+        prev_out = reduce_out_slots[prev_stride_w][prev_slot]
+        dk[:, :, prev_i:prev_i + prev_stride_w].copy_(prev_out[0])
+        dv[:, :, prev_i:prev_i + prev_stride_w].copy_(prev_out[1])
 
     return dq, dk, dv
 
@@ -591,6 +714,7 @@ class LlamaFlashAttnFunc(torch.autograd.Function):
         heads_k_stride: int,
         head_first_stride: Optional[int],
         pack_first_stride: bool,
+        head_last_stride: Optional[int],
         dropout_p: float,
         softmax_scale: Optional[float],
         causal: bool,
@@ -661,6 +785,8 @@ class LlamaFlashAttnFunc(torch.autograd.Function):
         ctx.group = group
         ctx.bwd_event_sync = bwd_event_sync
         ctx.heads_k_stride = heads_k_stride
+        ctx.head_first_stride = head_first_stride
+        ctx.head_last_stride = head_last_stride
         return out if not return_softmax else (out, softmax_lse, None)
 
     @staticmethod
@@ -684,12 +810,14 @@ class LlamaFlashAttnFunc(torch.autograd.Function):
             window_size=ctx.window_size,
             alibi_slopes=ctx.alibi_slopes,
             deterministic=ctx.deterministic,
+            head_first_stride=ctx.head_first_stride,
+            head_last_stride=ctx.head_last_stride,
             time_event=time_event,
         )
         if ctx.bwd_event_sync:
             time_event.synchronize()
-        # forward takes 15 args excluding ctx. return 3 grad + 12 None
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None
+        # forward takes 16 args excluding ctx. return 3 grad + 13 None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 def llama_fwd_ring_bwd_flash_attn_func(
@@ -772,6 +900,7 @@ def llama_flash_attn_func(
     heads_k_stride: int = 1,
     head_first_stride: Optional[int] = None,
     pack_first_stride: bool = True,
+    head_last_stride: Optional[int] = None,
     dropout_p: float = 0.0,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
@@ -790,6 +919,7 @@ def llama_flash_attn_func(
         heads_k_stride,
         head_first_stride,
         pack_first_stride,
+        head_last_stride,
         dropout_p,
         softmax_scale,
         causal,
@@ -900,6 +1030,7 @@ class ConditionalLlamaFlashAttnFunc(torch.autograd.Function):
         heads_k_stride: int,
         head_first_stride: Optional[int],
         pack_first_stride: bool,
+        head_last_stride: Optional[int],
         dropout_p: float,
         softmax_scale: Optional[float],
         causal: bool,
@@ -997,6 +1128,8 @@ class ConditionalLlamaFlashAttnFunc(torch.autograd.Function):
         ctx.deterministic = deterministic
         ctx.group = group
         ctx.heads_k_stride = heads_k_stride
+        ctx.head_first_stride = head_first_stride
+        ctx.head_last_stride = head_last_stride
         return out if not return_softmax else (out, softmax_lse, None)
 
     @staticmethod
@@ -1049,12 +1182,14 @@ class ConditionalLlamaFlashAttnFunc(torch.autograd.Function):
                 window_size=ctx.window_size,
                 alibi_slopes=ctx.alibi_slopes,
                 deterministic=ctx.deterministic,
+                head_first_stride=ctx.head_first_stride,
+                head_last_stride=ctx.head_last_stride,
                 time_event=time_event,
             )
         if ctx.bwd_event_sync:
             time_event.synchronize()
-        # forward takes 15 args excluding ctx. return 3 grad + 12 None
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None
+        # forward takes 16 args excluding ctx. return 3 grad + 13 None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 class ConditionalLlamaRingFlashAttnFunc(torch.autograd.Function):
@@ -1250,6 +1385,7 @@ def cond_llama_flash_attn_func(
     heads_k_stride: int = 1,
     head_first_stride: Optional[int] = None,
     pack_first_stride: bool = True,
+    head_last_stride: Optional[int] = None,
     dropout_p: float = 0.0,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
@@ -1272,6 +1408,7 @@ def cond_llama_flash_attn_func(
         heads_k_stride,
         head_first_stride,
         pack_first_stride,
+        head_last_stride,
         dropout_p,
         softmax_scale,
         causal,
