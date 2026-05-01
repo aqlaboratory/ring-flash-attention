@@ -553,18 +553,16 @@ def llama_flash_attn_backward(
         reduce_out = reduce_out_slots[stride_i][slot]
         scatter_in.copy_(grad_permuted)
 
-        # Signal to comm_stream that scatter_in is ready on the compute stream.
-        _compute_ready = torch.cuda.Event()
-        _compute_ready.record()
-        comm_stream.wait_event(_compute_ready)
-
-        with torch.cuda.stream(comm_stream):
-            h_dk = dist.reduce_scatter_tensor(
-                reduce_out[0], scatter_in[0], group=process_group, async_op=True
-            )
-            h_dv = dist.reduce_scatter_tensor(
-                reduce_out[1], scatter_in[1], group=process_group, async_op=True
-            )
+        # Issue from compute stream so NCCL automatically captures the scatter_in.copy_()
+        # dependency. NCCL runs on its own internal stream regardless of the calling stream;
+        # Work.wait() is called from comm_stream (see drain below) so compute_stream is
+        # never blocked by NCCL completion.
+        h_dk = dist.reduce_scatter_tensor(
+            reduce_out[0], scatter_in[0], group=process_group, async_op=True
+        )
+        h_dv = dist.reduce_scatter_tensor(
+            reduce_out[1], scatter_in[1], group=process_group, async_op=True
+        )
         prev_handles = (h_dk, h_dv, slot, i, stride_i)
 
         if step == 0 and time_event is not None:
