@@ -5,7 +5,6 @@ import torch.distributed as dist
 import torch.nn.functional as F
 import inspect
 from functools import cache
-import torch.distributed._functional_collectives as funcol
 
 
 __all__ = ["update_out_and_lse", "RingComm", "get_default_args"]
@@ -172,19 +171,27 @@ class AllGatherComm:
 class ReduceScatterHandleManager:
     def __init__(self, group=None):
         self.group = group
+        self._world_size = dist.get_world_size(group)
+        self._group_name = group.group_name
         self.pending = None
 
     def issue(self, scatter_in_dk: torch.Tensor, scatter_in_dv: torch.Tensor, head_offset: int, width: int):
-        out_dk = funcol.reduce_scatter_tensor(scatter_in_dk, 'sum', scatter_dim=0, group=self.group)
-        out_dv = funcol.reduce_scatter_tensor(scatter_in_dv, 'sum', scatter_dim=0, group=self.group)
+        out_dk = torch.ops._c10d_functional.reduce_scatter_tensor(
+            scatter_in_dk, 'sum', self._world_size, self._group_name
+        )
+        out_dv = torch.ops._c10d_functional.reduce_scatter_tensor(
+            scatter_in_dv, 'sum', self._world_size, self._group_name
+        )
         self.pending = (out_dk, out_dv, head_offset, width)
 
     def drain_to(self, dk: torch.Tensor, dv: torch.Tensor):
         if self.pending is None:
             return
         out_dk, out_dv, head_offset, width = self.pending
-        torch.ops._c10d_functional.wait_tensor(out_dk)
-        torch.ops._c10d_functional.wait_tensor(out_dv)
-        dk[:, :, head_offset:head_offset + width].copy_(out_dk)
-        dv[:, :, head_offset:head_offset + width].copy_(out_dv)
+        out_dk = torch.ops._c10d_functional.wait_tensor(out_dk)
+        out_dv = torch.ops._c10d_functional.wait_tensor(out_dv)
+        dk_slice = dk[:, :, head_offset:head_offset + width]
+        dv_slice = dv[:, :, head_offset:head_offset + width]
+        dk_slice.copy_(out_dk.reshape(dk_slice.shape))
+        dv_slice.copy_(out_dv.reshape(dv_slice.shape))
         self.pending = None
