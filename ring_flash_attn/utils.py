@@ -7,7 +7,57 @@ import inspect
 from functools import cache
 
 
-__all__ = ["update_out_and_lse", "RingComm", "get_default_args"]
+__all__ = [
+    "update_out_and_lse",
+    "RingComm",
+    "get_default_args",
+    "init_global_comm_stream",
+    "get_global_comm_stream",
+]
+
+
+_GLOBAL_COMM_STREAMS = {}
+
+
+def _resolve_group(group):
+    if group is None:
+        return dist.distributed_c10d._get_default_group()
+    return group
+
+
+def _stream_key(group, device) -> Tuple[str, int]:
+    resolved_group = _resolve_group(group)
+    dev = torch.device(device)
+    if dev.type != "cuda":
+        raise ValueError(f"global comm stream only supports cuda device, got {dev}")
+    if dev.index is None:
+        dev_index = torch.cuda.current_device()
+    else:
+        dev_index = dev.index
+    return resolved_group.group_name, dev_index
+
+
+def init_global_comm_stream(group=None, device=None):
+    """Initialize and return one comm stream per (process-group, cuda-device)."""
+    if not torch.cuda.is_available():
+        return None
+    if device is None:
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    key = _stream_key(group, device)
+    if key not in _GLOBAL_COMM_STREAMS:
+        _, dev_index = key
+        with torch.cuda.device(dev_index):
+            _GLOBAL_COMM_STREAMS[key] = torch.cuda.Stream()
+    return _GLOBAL_COMM_STREAMS[key]
+
+
+def get_global_comm_stream(group=None, device=None):
+    if not torch.cuda.is_available():
+        return None
+    if device is None:
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    key = _stream_key(group, device)
+    return _GLOBAL_COMM_STREAMS.get(key)
 
 
 @cache
@@ -169,13 +219,12 @@ class AllGatherComm:
 
 
 class ReduceScatterHandleManager:
-    def __init__(self, group=None):
-        if group is None:
-            group = dist.distributed_c10d._get_default_group()
+    def __init__(self, group=None, device=None):
+        group = _resolve_group(group)
         self.group = group
         self._world_size = dist.get_world_size(group)
         self._group_name = group.group_name
-        self._comm_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+        self._comm_stream = get_global_comm_stream(group=group, device=device)
         self.pending = None
 
     def issue(

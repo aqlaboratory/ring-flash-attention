@@ -8,6 +8,7 @@ from .utils import (
     get_default_args,
     AllGatherComm as Comm,
     ReduceScatterHandleManager,
+    init_global_comm_stream,
 )
 import logging
 import torch.distributed._tensor as distp_tensor
@@ -81,6 +82,7 @@ def llama_flash_attn_forward(
     assert nheads_k % heads_k_stride == 0
 
     world_size = dist.get_world_size(process_group)
+    init_global_comm_stream(group=process_group, device=k.device)
 
     # Main buffers for standard stride operations
     kv_buffer = torch.empty(
@@ -413,7 +415,7 @@ def llama_flash_attn_backward(
     dv = torch.empty_like(v)
 
     comm = Comm(process_group)
-    reduce_scatter_manager = ReduceScatterHandleManager(group=process_group)
+    reduce_scatter_manager = ReduceScatterHandleManager(group=process_group, device=k.device)
 
     # ---- Initial all_gather for step 0 ----
     first_stride_size = stride_pattern[0]
