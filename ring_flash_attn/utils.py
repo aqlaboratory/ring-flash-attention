@@ -5,6 +5,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 import inspect
 from functools import cache
+from torch.distributed.distributed_c10d import _get_group_tag
 
 
 __all__ = ["update_out_and_lse", "RingComm", "get_default_args"]
@@ -169,41 +170,33 @@ class AllGatherComm:
 
 
 class ReduceScatterHandleManager:
-    def __init__(self, group=None, reduce_out_slots=None, comm_stream=None):
+    def __init__(self, group=None):
         self.group = group
-        self.reduce_out_slots = reduce_out_slots
-        self.comm_stream = comm_stream
+        if group is not None:
+            self._tag = _get_group_tag(group)
+            self._world_size = dist.get_world_size(group)
+            self._ranks = [dist.get_global_rank(group, i) for i in range(self._world_size)]
+        else:
+            self._tag = ""
+            self._world_size = dist.get_world_size()
+            self._ranks = list(range(self._world_size))
         self.pending = None
 
-    def issue(self, scatter_in, reduce_out, slot: int, head_offset: int, width: int):
-        h_dk = dist.reduce_scatter_tensor(
-            reduce_out[0], scatter_in[0], group=self.group, async_op=True
+    def issue(self, scatter_in_dk: torch.Tensor, scatter_in_dv: torch.Tensor, head_offset: int, width: int):
+        out_dk = torch.ops._c10d_functional.reduce_scatter_tensor(
+            scatter_in_dk, 'sum', self._tag, self._ranks, self._world_size
         )
-        h_dv = dist.reduce_scatter_tensor(
-            reduce_out[1], scatter_in[1], group=self.group, async_op=True
+        out_dv = torch.ops._c10d_functional.reduce_scatter_tensor(
+            scatter_in_dv, 'sum', self._tag, self._ranks, self._world_size
         )
-        self.pending = (h_dk, h_dv, slot, head_offset, width)
+        self.pending = (out_dk, out_dv, head_offset, width)
 
     def drain_to(self, dk: torch.Tensor, dv: torch.Tensor):
         if self.pending is None:
             return
-
-        h_dk, h_dv, slot, head_offset, width = self.pending
-        if self.comm_stream is not None:
-            with torch.cuda.stream(self.comm_stream):
-                h_dk.wait()
-                h_dv.wait()
-                comm_done = torch.cuda.Event()
-                comm_done.record()
-            torch.cuda.current_stream().wait_event(comm_done)
-        else:
-            h_dk.wait()
-            h_dv.wait()
-
-        if self.reduce_out_slots is None:
-            raise RuntimeError("reduce_out_slots must be set before draining")
-
-        reduce_out = self.reduce_out_slots[width][slot]
-        dk[:, :, head_offset:head_offset + width].copy_(reduce_out[0])
-        dv[:, :, head_offset:head_offset + width].copy_(reduce_out[1])
+        out_dk, out_dv, head_offset, width = self.pending
+        torch.ops._c10d_functional.wait_tensor(out_dk)
+        torch.ops._c10d_functional.wait_tensor(out_dv)
+        dk[:, :, head_offset:head_offset + width].copy_(out_dk)
+        dv[:, :, head_offset:head_offset + width].copy_(out_dv)
         self.pending = None

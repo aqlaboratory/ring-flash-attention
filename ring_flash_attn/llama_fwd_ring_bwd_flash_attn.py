@@ -360,9 +360,6 @@ def llama_flash_attn_backward(
     def scatter_in_shape(width):
         return (2, world_size, batch_k, seq_k, width, head_dim)
 
-    def reduce_out_shape(width):
-        return (2, batch_k, seq_k, width, head_dim)
-
     # KV all_gather destinations: dedicated buffers for first/last small steps,
     # double-buffered swap pair (kv_buf_main / kv_buf_copy) shared across middle steps.
     kv_bufs_per_step = [None] * n_steps
@@ -405,13 +402,6 @@ def llama_flash_attn_backward(
         ]
         for w in unique_widths
     }
-    reduce_out_slots = {
-        w: [
-            torch.empty(reduce_out_shape(w), dtype=torch.float32, device=k.device)
-            for _ in range(2)
-        ]
-        for w in unique_widths
-    }
     next_slot_by_width = {w: 0 for w in unique_widths}
 
     dq = torch.empty_like(q)
@@ -419,13 +409,7 @@ def llama_flash_attn_backward(
     dv = torch.empty_like(v)
 
     comm = Comm(process_group)
-    # Dedicated stream for reduce_scatter so collectives run concurrently with
-    # flash_attn_backward on the compute stream (avoids inserting cudaStreamWaitEvent
-    # on the compute stream when draining Work handles).
-    comm_stream = torch.cuda.Stream()
-    reduce_scatter_manager = ReduceScatterHandleManager(
-        group=process_group, reduce_out_slots=reduce_out_slots, comm_stream=comm_stream
-    )
+    reduce_scatter_manager = ReduceScatterHandleManager(group=process_group)
 
     # ---- Initial all_gather for step 0 ----
     first_stride_size = stride_pattern[0]
@@ -544,14 +528,8 @@ def llama_flash_attn_backward(
         next_slot_by_width[stride_i] = 1 - slot
 
         scatter_in = scatter_in_slots[stride_i][slot]
-        reduce_out = reduce_out_slots[stride_i][slot]
         scatter_in.copy_(grad_permuted)
-
-        # Issue from compute stream so NCCL automatically captures the scatter_in.copy_()
-        # dependency. NCCL runs on its own internal stream regardless of the calling stream;
-        # Work.wait() is called from comm_stream (see drain below) so compute_stream is
-        # never blocked by NCCL completion.
-        reduce_scatter_manager.issue(scatter_in, reduce_out, slot, i, stride_i)
+        reduce_scatter_manager.issue(scatter_in[0], scatter_in[1], i, stride_i)
 
         if step == 0 and time_event is not None:
             time_event.record()
