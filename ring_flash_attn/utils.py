@@ -172,22 +172,16 @@ class AllGatherComm:
 class ReduceScatterHandleManager:
     def __init__(self, group=None):
         self.group = group
-        if group is not None:
-            self._tag = _get_group_tag(group)
-            self._world_size = dist.get_world_size(group)
-            self._ranks = [dist.get_global_rank(group, i) for i in range(self._world_size)]
-        else:
-            self._tag = ""
-            self._world_size = dist.get_world_size()
-            self._ranks = list(range(self._world_size))
+        self._tag = _get_group_tag(group) if group is not None else ""
+        self._world_size = dist.get_world_size(group)
         self.pending = None
 
     def issue(self, scatter_in_dk: torch.Tensor, scatter_in_dv: torch.Tensor, head_offset: int, width: int):
         out_dk = torch.ops._c10d_functional.reduce_scatter_tensor(
-            scatter_in_dk, 'sum', self._tag, self._ranks, self._world_size
+            scatter_in_dk, 'sum', self._world_size, self._tag
         )
         out_dv = torch.ops._c10d_functional.reduce_scatter_tensor(
-            scatter_in_dv, 'sum', self._tag, self._ranks, self._world_size
+            scatter_in_dv, 'sum', self._world_size, self._tag
         )
         self.pending = (out_dk, out_dv, head_offset, width)
 
