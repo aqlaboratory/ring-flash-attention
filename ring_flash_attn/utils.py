@@ -166,3 +166,44 @@ class AllGatherComm:
         for handle in self.handles:
             handle.wait()
         self.handles = []
+
+
+class ReduceScatterHandleManager:
+    def __init__(self, group=None, reduce_out_slots=None, comm_stream=None):
+        self.group = group
+        self.reduce_out_slots = reduce_out_slots
+        self.comm_stream = comm_stream
+        self.pending = None
+
+    def issue(self, scatter_in, reduce_out, slot: int, head_offset: int, width: int):
+        h_dk = dist.reduce_scatter_tensor(
+            reduce_out[0], scatter_in[0], group=self.group, async_op=True
+        )
+        h_dv = dist.reduce_scatter_tensor(
+            reduce_out[1], scatter_in[1], group=self.group, async_op=True
+        )
+        self.pending = (h_dk, h_dv, slot, head_offset, width)
+
+    def drain_to(self, dk: torch.Tensor, dv: torch.Tensor):
+        if self.pending is None:
+            return
+
+        h_dk, h_dv, slot, head_offset, width = self.pending
+        if self.comm_stream is not None:
+            with torch.cuda.stream(self.comm_stream):
+                h_dk.wait()
+                h_dv.wait()
+                comm_done = torch.cuda.Event()
+                comm_done.record()
+            torch.cuda.current_stream().wait_event(comm_done)
+        else:
+            h_dk.wait()
+            h_dv.wait()
+
+        if self.reduce_out_slots is None:
+            raise RuntimeError("reduce_out_slots must be set before draining")
+
+        reduce_out = self.reduce_out_slots[width][slot]
+        dk[:, :, head_offset:head_offset + width].copy_(reduce_out[0])
+        dv[:, :, head_offset:head_offset + width].copy_(reduce_out[1])
+        self.pending = None

@@ -4,7 +4,11 @@ from flash_attn.flash_attn_interface import _flash_attn_forward, _flash_attn_bac
 from .ring_flash_attn import ring_flash_attn_backward
 from einops import rearrange
 from typing import Optional, Tuple
-from .utils import get_default_args, AllGatherComm as Comm
+from .utils import (
+    get_default_args,
+    AllGatherComm as Comm,
+    ReduceScatterHandleManager,
+)
 import logging
 import torch.distributed._tensor as distp_tensor
 import flash_attn
@@ -419,6 +423,9 @@ def llama_flash_attn_backward(
     # flash_attn_backward on the compute stream (avoids inserting cudaStreamWaitEvent
     # on the compute stream when draining Work handles).
     comm_stream = torch.cuda.Stream()
+    reduce_scatter_manager = ReduceScatterHandleManager(
+        group=process_group, reduce_out_slots=reduce_out_slots, comm_stream=comm_stream
+    )
 
     # ---- Initial all_gather for step 0 ----
     first_stride_size = stride_pattern[0]
@@ -431,9 +438,6 @@ def llama_flash_attn_backward(
         first_dst = kv_buf_main
     comm.all_gather(first_dst[0], k_0)
     comm.all_gather(first_dst[1], v_0)
-
-    # ---- Pipeline state: previous iteration's in-flight reduce_scatter ----
-    prev_handles = None  # (handle_dk, handle_dv, slot, i, stride_w)
 
     for step, (i, stride_i) in enumerate(zip(head_offsets, stride_pattern)):
         comm.wait()
@@ -529,17 +533,7 @@ def llama_flash_attn_backward(
         # Done AFTER flash_attn_backward so they overlap on the GPU.
         # Wait on comm_stream (not compute stream) so cudaStreamWaitEvent is NOT
         # inserted on the compute stream, preserving compute/NCCL overlap.
-        if prev_handles is not None:
-            prev_h_dk, prev_h_dv, prev_slot, prev_i, prev_stride_w = prev_handles
-            with torch.cuda.stream(comm_stream):
-                prev_h_dk.wait()
-                prev_h_dv.wait()
-                _comm_done = torch.cuda.Event()
-                _comm_done.record()
-            torch.cuda.current_stream().wait_event(_comm_done)
-            prev_out = reduce_out_slots[prev_stride_w][prev_slot]
-            dk[:, :, prev_i:prev_i + prev_stride_w].copy_(prev_out[0])
-            dv[:, :, prev_i:prev_i + prev_stride_w].copy_(prev_out[1])
+        reduce_scatter_manager.drain_to(dk, dv)
 
         # ---- Stage and issue THIS iteration's async reduce_scatter ----
         # Permute (2, B, W*S, H, D) -> (2, W, B, S, H, D) and upcast to fp32 via copy_.
@@ -557,29 +551,13 @@ def llama_flash_attn_backward(
         # dependency. NCCL runs on its own internal stream regardless of the calling stream;
         # Work.wait() is called from comm_stream (see drain below) so compute_stream is
         # never blocked by NCCL completion.
-        h_dk = dist.reduce_scatter_tensor(
-            reduce_out[0], scatter_in[0], group=process_group, async_op=True
-        )
-        h_dv = dist.reduce_scatter_tensor(
-            reduce_out[1], scatter_in[1], group=process_group, async_op=True
-        )
-        prev_handles = (h_dk, h_dv, slot, i, stride_i)
+        reduce_scatter_manager.issue(scatter_in, reduce_out, slot, i, stride_i)
 
         if step == 0 and time_event is not None:
             time_event.record()
 
     # ---- Drain the final reduce_scatter ----
-    if prev_handles is not None:
-        prev_h_dk, prev_h_dv, prev_slot, prev_i, prev_stride_w = prev_handles
-        with torch.cuda.stream(comm_stream):
-            prev_h_dk.wait()
-            prev_h_dv.wait()
-            _comm_done = torch.cuda.Event()
-            _comm_done.record()
-        torch.cuda.current_stream().wait_event(_comm_done)
-        prev_out = reduce_out_slots[prev_stride_w][prev_slot]
-        dk[:, :, prev_i:prev_i + prev_stride_w].copy_(prev_out[0])
-        dv[:, :, prev_i:prev_i + prev_stride_w].copy_(prev_out[1])
+    reduce_scatter_manager.drain_to(dk, dv)
 
     return dq, dk, dv
 
