@@ -402,6 +402,10 @@ def llama_flash_attn_backward(
         ]
         for w in unique_widths
     }
+    scatter_ready_events = {
+        w: [torch.cuda.Event(enable_timing=False) for _ in range(2)]
+        for w in unique_widths
+    }
     next_slot_by_width = {w: 0 for w in unique_widths}
 
     dq = torch.empty_like(q)
@@ -528,8 +532,12 @@ def llama_flash_attn_backward(
         next_slot_by_width[stride_i] = 1 - slot
 
         scatter_in = scatter_in_slots[stride_i][slot]
+        ready_event = scatter_ready_events[stride_i][slot]
         scatter_in.copy_(grad_permuted)
-        reduce_scatter_manager.issue(scatter_in[0], scatter_in[1], i, stride_i)
+        ready_event.record()
+        reduce_scatter_manager.issue(
+            scatter_in[0], scatter_in[1], i, stride_i, ready_event=ready_event
+        )
 
         if step == 0 and time_event is not None:
             time_event.record()

@@ -175,21 +175,42 @@ class ReduceScatterHandleManager:
         self.group = group
         self._world_size = dist.get_world_size(group)
         self._group_name = group.group_name
+        self._comm_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
         self.pending = None
 
-    def issue(self, scatter_in_dk: torch.Tensor, scatter_in_dv: torch.Tensor, head_offset: int, width: int):
-        out_dk = torch.ops._c10d_functional.reduce_scatter_tensor(
-            scatter_in_dk, 'sum', self._world_size, self._group_name
-        )
-        out_dv = torch.ops._c10d_functional.reduce_scatter_tensor(
-            scatter_in_dv, 'sum', self._world_size, self._group_name
-        )
+    def issue(
+        self,
+        scatter_in_dk: torch.Tensor,
+        scatter_in_dv: torch.Tensor,
+        head_offset: int,
+        width: int,
+        ready_event: Optional[torch.cuda.Event] = None,
+    ):
+        if self._comm_stream is None:
+            out_dk = torch.ops._c10d_functional.reduce_scatter_tensor(
+                scatter_in_dk, 'sum', self._world_size, self._group_name
+            )
+            out_dv = torch.ops._c10d_functional.reduce_scatter_tensor(
+                scatter_in_dv, 'sum', self._world_size, self._group_name
+            )
+        else:
+            with torch.cuda.stream(self._comm_stream):
+                if ready_event is not None:
+                    self._comm_stream.wait_event(ready_event)
+                out_dk = torch.ops._c10d_functional.reduce_scatter_tensor(
+                    scatter_in_dk, 'sum', self._world_size, self._group_name
+                )
+                out_dv = torch.ops._c10d_functional.reduce_scatter_tensor(
+                    scatter_in_dv, 'sum', self._world_size, self._group_name
+                )
         self.pending = (out_dk, out_dv, head_offset, width)
 
     def drain_to(self, dk: torch.Tensor, dv: torch.Tensor):
         if self.pending is None:
             return
         out_dk, out_dv, head_offset, width = self.pending
+        if self._comm_stream is not None and dk.is_cuda:
+            torch.cuda.current_stream(device=dk.device).wait_stream(self._comm_stream)
         out_dk = torch.ops._c10d_functional.wait_tensor(out_dk)
         out_dv = torch.ops._c10d_functional.wait_tensor(out_dv)
         dk_slice = dk[:, :, head_offset:head_offset + width]
