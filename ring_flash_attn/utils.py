@@ -166,3 +166,59 @@ class AllGatherComm:
         for handle in self.handles:
             handle.wait()
         self.handles = []
+
+
+class ReduceScatterHandleManager:
+    def __init__(self, group=None, device=None, use_coalesced: Optional[bool] = None):
+        if group is None:
+            group = dist.distributed_c10d._get_default_group()
+        self.group = group
+        self._world_size = dist.get_world_size(group)
+        self._group_name = group.group_name
+        self._supports_coalesced = hasattr(
+            torch.ops._c10d_functional, "reduce_scatter_tensor_coalesced"
+        )
+        if use_coalesced is None:
+            self._use_coalesced = self._supports_coalesced
+        else:
+            self._use_coalesced = use_coalesced and self._supports_coalesced
+        self.pending = None
+
+    def issue(
+        self,
+        scatter_in_dk: torch.Tensor,
+        scatter_in_dv: torch.Tensor,
+        head_offset: int,
+        width: int,
+    ):
+        if self.pending is not None:
+            raise RuntimeError("issue called before draining previous reduce_scatter")
+
+        if self._use_coalesced:
+            out_dk, out_dv = torch.ops._c10d_functional.reduce_scatter_tensor_coalesced(
+                [scatter_in_dk, scatter_in_dv],
+                "sum",
+                self._world_size,
+                self._group_name,
+            )
+        else:
+            out_dk = torch.ops._c10d_functional.reduce_scatter_tensor(
+                scatter_in_dk, "sum", self._world_size, self._group_name
+            )
+            out_dv = torch.ops._c10d_functional.reduce_scatter_tensor(
+                scatter_in_dv, "sum", self._world_size, self._group_name
+            )
+
+        self.pending = (out_dk, out_dv, head_offset, width)
+
+    def drain_to(self, dk: torch.Tensor, dv: torch.Tensor):
+        if self.pending is None:
+            return
+        out_dk, out_dv, head_offset, width = self.pending
+        out_dk = torch.ops._c10d_functional.wait_tensor(out_dk)
+        out_dv = torch.ops._c10d_functional.wait_tensor(out_dv)
+        dk_slice = dk[:, :, head_offset:head_offset + width]
+        dv_slice = dv[:, :, head_offset:head_offset + width]
+        dk_slice.copy_(out_dk.reshape(dk_slice.shape))
+        dv_slice.copy_(out_dv.reshape(dv_slice.shape))
+        self.pending = None

@@ -4,7 +4,11 @@ from flash_attn.flash_attn_interface import _flash_attn_forward, _flash_attn_bac
 from .ring_flash_attn import ring_flash_attn_backward
 from einops import rearrange
 from typing import Optional, Tuple
-from .utils import get_default_args, AllGatherComm as Comm
+from .utils import (
+    get_default_args,
+    AllGatherComm as Comm,
+    ReduceScatterHandleManager,
+)
 import logging
 import torch.distributed._tensor as distp_tensor
 import flash_attn
@@ -356,9 +360,6 @@ def llama_flash_attn_backward(
     def scatter_in_shape(width):
         return (2, world_size, batch_k, seq_k, width, head_dim)
 
-    def reduce_out_shape(width):
-        return (2, batch_k, seq_k, width, head_dim)
-
     # KV all_gather destinations: dedicated buffers for first/last small steps,
     # double-buffered swap pair (kv_buf_main / kv_buf_copy) shared across middle steps.
     kv_bufs_per_step = [None] * n_steps
@@ -392,33 +393,22 @@ def llama_flash_attn_backward(
         for w in unique_widths
     }
 
-    # Reduce_scatter staging buffers (fp32 for cross-rank precision).
-    # Two slots per width to ping-pong while the previous reduce_scatter is in flight.
-    scatter_in_slots = {
-        w: [
-            torch.empty(scatter_in_shape(w), dtype=torch.float32, device=k.device)
-            for _ in range(2)
-        ]
+    # fp32 staging buffers for cross-rank precision before reduce_scatter.
+    scatter_in_by_width = {
+        w: torch.empty(scatter_in_shape(w), dtype=torch.float32, device=k.device)
         for w in unique_widths
     }
-    reduce_out_slots = {
-        w: [
-            torch.empty(reduce_out_shape(w), dtype=torch.float32, device=k.device)
-            for _ in range(2)
-        ]
-        for w in unique_widths
-    }
-    next_slot_by_width = {w: 0 for w in unique_widths}
 
     dq = torch.empty_like(q)
     dk = torch.empty_like(k)
     dv = torch.empty_like(v)
 
     comm = Comm(process_group)
-    # Dedicated stream for reduce_scatter so collectives run concurrently with
-    # flash_attn_backward on the compute stream (avoids inserting cudaStreamWaitEvent
-    # on the compute stream when draining Work handles).
-    comm_stream = torch.cuda.Stream()
+    use_coalesced_reduce_scatter = os.getenv("RFA_USE_RS_COALESCED", "1") != "0"
+    rs_manager = ReduceScatterHandleManager(
+        group=process_group,
+        use_coalesced=use_coalesced_reduce_scatter,
+    )
 
     # ---- Initial all_gather for step 0 ----
     first_stride_size = stride_pattern[0]
@@ -431,9 +421,6 @@ def llama_flash_attn_backward(
         first_dst = kv_buf_main
     comm.all_gather(first_dst[0], k_0)
     comm.all_gather(first_dst[1], v_0)
-
-    # ---- Pipeline state: previous iteration's in-flight reduce_scatter ----
-    prev_handles = None  # (handle_dk, handle_dv, slot, i, stride_w)
 
     for step, (i, stride_i) in enumerate(zip(head_offsets, stride_pattern)):
         comm.wait()
@@ -525,61 +512,23 @@ def llama_flash_attn_backward(
         _wrapped_flash_attn_backward(**params)
         del k_i, v_i, q_i, dout_i, out_i
 
-        # ---- Drain the previous iteration's async reduce_scatter ----
-        # Done AFTER flash_attn_backward so they overlap on the GPU.
-        # Wait on comm_stream (not compute stream) so cudaStreamWaitEvent is NOT
-        # inserted on the compute stream, preserving compute/NCCL overlap.
-        if prev_handles is not None:
-            prev_h_dk, prev_h_dv, prev_slot, prev_i, prev_stride_w = prev_handles
-            with torch.cuda.stream(comm_stream):
-                prev_h_dk.wait()
-                prev_h_dv.wait()
-                _comm_done = torch.cuda.Event()
-                _comm_done.record()
-            torch.cuda.current_stream().wait_event(_comm_done)
-            prev_out = reduce_out_slots[prev_stride_w][prev_slot]
-            dk[:, :, prev_i:prev_i + prev_stride_w].copy_(prev_out[0])
-            dv[:, :, prev_i:prev_i + prev_stride_w].copy_(prev_out[1])
+        # Drain previous iteration's reduce_scatter after compute to keep issue/wait cadence.
+        rs_manager.drain_to(dk, dv)
 
         # ---- Stage and issue THIS iteration's async reduce_scatter ----
         # Permute (2, B, W*S, H, D) -> (2, W, B, S, H, D) and upcast to fp32 via copy_.
         grad_view = dkv_buf.view(2, batch_k, world_size, seq_k, stride_i, head_dim)
         grad_permuted = grad_view.permute(0, 2, 1, 3, 4, 5)
 
-        slot = next_slot_by_width[stride_i]
-        next_slot_by_width[stride_i] = 1 - slot
-
-        scatter_in = scatter_in_slots[stride_i][slot]
-        reduce_out = reduce_out_slots[stride_i][slot]
+        scatter_in = scatter_in_by_width[stride_i]
         scatter_in.copy_(grad_permuted)
-
-        # Issue from compute stream so NCCL automatically captures the scatter_in.copy_()
-        # dependency. NCCL runs on its own internal stream regardless of the calling stream;
-        # Work.wait() is called from comm_stream (see drain below) so compute_stream is
-        # never blocked by NCCL completion.
-        h_dk = dist.reduce_scatter_tensor(
-            reduce_out[0], scatter_in[0], group=process_group, async_op=True
-        )
-        h_dv = dist.reduce_scatter_tensor(
-            reduce_out[1], scatter_in[1], group=process_group, async_op=True
-        )
-        prev_handles = (h_dk, h_dv, slot, i, stride_i)
+        rs_manager.issue(scatter_in[0], scatter_in[1], i, stride_i)
 
         if step == 0 and time_event is not None:
             time_event.record()
 
     # ---- Drain the final reduce_scatter ----
-    if prev_handles is not None:
-        prev_h_dk, prev_h_dv, prev_slot, prev_i, prev_stride_w = prev_handles
-        with torch.cuda.stream(comm_stream):
-            prev_h_dk.wait()
-            prev_h_dv.wait()
-            _comm_done = torch.cuda.Event()
-            _comm_done.record()
-        torch.cuda.current_stream().wait_event(_comm_done)
-        prev_out = reduce_out_slots[prev_stride_w][prev_slot]
-        dk[:, :, prev_i:prev_i + prev_stride_w].copy_(prev_out[0])
-        dv[:, :, prev_i:prev_i + prev_stride_w].copy_(prev_out[1])
+    rs_manager.drain_to(dk, dv)
 
     return dq, dk, dv
 
