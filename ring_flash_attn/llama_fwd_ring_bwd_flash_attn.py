@@ -258,8 +258,8 @@ def llama_flash_attn_backward(
     softcap=0.0,
     alibi_slopes=None,
     deterministic=False,
-    head_first_stride: Optional[int] = None,
-    head_last_stride: Optional[int] = None,
+    bwd_head_first_stride: Optional[int] = None,
+    bwd_head_last_stride: Optional[int] = None,
     time_event=None,
 ):
     """
@@ -269,10 +269,10 @@ def llama_flash_attn_backward(
     across a process group using all-gather operations and aggregating dk/dv via reduce_scatter.
 
     Communication is overlapped with compute on both ends:
-    - The first iteration's all_gather can be shrunk via `head_first_stride` (mirroring forward),
-      splitting the first chunk into [head_first_stride, heads_k_stride - head_first_stride].
-    - The last iteration's reduce_scatter can be shrunk via `head_last_stride`, splitting the
-      last chunk into [heads_k_stride - head_last_stride, head_last_stride].
+        - The first iteration's all_gather can be shrunk via `bwd_head_first_stride`,
+            splitting the first chunk into [bwd_head_first_stride, heads_k_stride - bwd_head_first_stride].
+        - The last iteration's reduce_scatter can be shrunk via `bwd_head_last_stride`, splitting the
+            last chunk into [heads_k_stride - bwd_head_last_stride, bwd_head_last_stride].
     - All interior reduce_scatters run async and overlap with the next iteration's
       flash_attn_backward; only the final, optionally smaller, reduce_scatter is exposed.
 
@@ -292,9 +292,9 @@ def llama_flash_attn_backward(
         softcap (float, optional): Softcap for attention scores. Defaults to 0.0.
         alibi_slopes (Optional[torch.Tensor], optional): ALiBi slopes for positional bias. Defaults to None.
         deterministic (bool, optional): Whether to use deterministic algorithms. Defaults to False.
-        head_first_stride (Optional[int], optional): Smaller stride for the first iteration to reduce
+        bwd_head_first_stride (Optional[int], optional): Smaller stride for the first backward iteration to reduce
             the size of the un-overlapped initial all_gather. Must be in (0, heads_k_stride). Defaults to None.
-        head_last_stride (Optional[int], optional): Smaller stride for the last iteration to reduce
+        bwd_head_last_stride (Optional[int], optional): Smaller stride for the last backward iteration to reduce
             the size of the un-overlapped final reduce_scatter. Must be in (0, heads_k_stride). Defaults to None.
         time_event (Optional[torch.cuda.Event], optional): CUDA event for timing or synchronization. Defaults to None.
 
@@ -311,27 +311,27 @@ def llama_flash_attn_backward(
 
     # ---- Build stride pattern (mirrors forward, extended for the tail) ----
     n_full = nheads_k // heads_k_stride
-    if head_first_stride is not None:
-        assert 0 < head_first_stride < heads_k_stride, (
-            "head_first_stride must be between 0 and heads_k_stride"
+    if bwd_head_first_stride is not None:
+        assert 0 < bwd_head_first_stride < heads_k_stride, (
+            "bwd_head_first_stride must be between 0 and heads_k_stride"
         )
-        first_part = [head_first_stride, heads_k_stride - head_first_stride]
+        first_part = [bwd_head_first_stride, heads_k_stride - bwd_head_first_stride]
         n_full -= 1
     else:
         first_part = []
 
-    if head_last_stride is not None:
-        assert 0 < head_last_stride < heads_k_stride, (
-            "head_last_stride must be between 0 and heads_k_stride"
+    if bwd_head_last_stride is not None:
+        assert 0 < bwd_head_last_stride < heads_k_stride, (
+            "bwd_head_last_stride must be between 0 and heads_k_stride"
         )
-        last_part = [heads_k_stride - head_last_stride, head_last_stride]
+        last_part = [heads_k_stride - bwd_head_last_stride, bwd_head_last_stride]
         n_full -= 1
     else:
         last_part = []
 
     assert n_full >= 0, (
         f"nheads_k={nheads_k}, heads_k_stride={heads_k_stride} too small to fit "
-        f"both head_first_stride and head_last_stride splits"
+        f"both bwd_head_first_stride and bwd_head_last_stride splits"
     )
 
     stride_pattern = first_part + [heads_k_stride] * n_full + last_part
@@ -365,17 +365,17 @@ def llama_flash_attn_backward(
     kv_bufs_per_step = [None] * n_steps
     if n_first >= 1:
         kv_bufs_per_step[0] = torch.empty(
-            kv_shape(head_first_stride), dtype=k.dtype, device=k.device
+            kv_shape(bwd_head_first_stride), dtype=k.dtype, device=k.device
         )
         kv_bufs_per_step[1] = torch.empty(
-            kv_shape(heads_k_stride - head_first_stride), dtype=k.dtype, device=k.device
+            kv_shape(heads_k_stride - bwd_head_first_stride), dtype=k.dtype, device=k.device
         )
     if n_last >= 1:
         kv_bufs_per_step[n_steps - 2] = torch.empty(
-            kv_shape(heads_k_stride - head_last_stride), dtype=k.dtype, device=k.device
+            kv_shape(heads_k_stride - bwd_head_last_stride), dtype=k.dtype, device=k.device
         )
         kv_bufs_per_step[n_steps - 1] = torch.empty(
-            kv_shape(head_last_stride), dtype=k.dtype, device=k.device
+            kv_shape(bwd_head_last_stride), dtype=k.dtype, device=k.device
         )
 
     if middle_end > middle_start:
@@ -681,7 +681,8 @@ class LlamaFlashAttnFunc(torch.autograd.Function):
         heads_k_stride: int,
         head_first_stride: Optional[int],
         pack_first_stride: bool,
-        head_last_stride: Optional[int],
+        bwd_head_first_stride: Optional[int],
+        bwd_head_last_stride: Optional[int],
         dropout_p: float,
         softmax_scale: Optional[float],
         causal: bool,
@@ -752,8 +753,8 @@ class LlamaFlashAttnFunc(torch.autograd.Function):
         ctx.group = group
         ctx.bwd_event_sync = bwd_event_sync
         ctx.heads_k_stride = heads_k_stride
-        ctx.head_first_stride = head_first_stride
-        ctx.head_last_stride = head_last_stride
+        ctx.bwd_head_first_stride = bwd_head_first_stride
+        ctx.bwd_head_last_stride = bwd_head_last_stride
         return out if not return_softmax else (out, softmax_lse, None)
 
     @staticmethod
@@ -777,14 +778,14 @@ class LlamaFlashAttnFunc(torch.autograd.Function):
             window_size=ctx.window_size,
             alibi_slopes=ctx.alibi_slopes,
             deterministic=ctx.deterministic,
-            head_first_stride=ctx.head_first_stride,
-            head_last_stride=ctx.head_last_stride,
+            bwd_head_first_stride=ctx.bwd_head_first_stride,
+            bwd_head_last_stride=ctx.bwd_head_last_stride,
             time_event=time_event,
         )
         if ctx.bwd_event_sync:
             time_event.synchronize()
-        # forward takes 16 args excluding ctx. return 3 grad + 13 None
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None
+        # forward takes 17 args excluding ctx. return 3 grad + 14 None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 def llama_fwd_ring_bwd_flash_attn_func(
@@ -867,7 +868,8 @@ def llama_flash_attn_func(
     heads_k_stride: int = 1,
     head_first_stride: Optional[int] = None,
     pack_first_stride: bool = True,
-    head_last_stride: Optional[int] = None,
+    bwd_head_first_stride: Optional[int] = None,
+    bwd_head_last_stride: Optional[int] = None,
     dropout_p: float = 0.0,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
@@ -886,7 +888,8 @@ def llama_flash_attn_func(
         heads_k_stride,
         head_first_stride,
         pack_first_stride,
-        head_last_stride,
+        bwd_head_first_stride,
+        bwd_head_last_stride,
         dropout_p,
         softmax_scale,
         causal,
@@ -997,7 +1000,8 @@ class ConditionalLlamaFlashAttnFunc(torch.autograd.Function):
         heads_k_stride: int,
         head_first_stride: Optional[int],
         pack_first_stride: bool,
-        head_last_stride: Optional[int],
+        bwd_head_first_stride: Optional[int],
+        bwd_head_last_stride: Optional[int],
         dropout_p: float,
         softmax_scale: Optional[float],
         causal: bool,
@@ -1095,8 +1099,8 @@ class ConditionalLlamaFlashAttnFunc(torch.autograd.Function):
         ctx.deterministic = deterministic
         ctx.group = group
         ctx.heads_k_stride = heads_k_stride
-        ctx.head_first_stride = head_first_stride
-        ctx.head_last_stride = head_last_stride
+        ctx.bwd_head_first_stride = bwd_head_first_stride
+        ctx.bwd_head_last_stride = bwd_head_last_stride
         return out if not return_softmax else (out, softmax_lse, None)
 
     @staticmethod
@@ -1149,14 +1153,14 @@ class ConditionalLlamaFlashAttnFunc(torch.autograd.Function):
                 window_size=ctx.window_size,
                 alibi_slopes=ctx.alibi_slopes,
                 deterministic=ctx.deterministic,
-                head_first_stride=ctx.head_first_stride,
-                head_last_stride=ctx.head_last_stride,
+                bwd_head_first_stride=ctx.bwd_head_first_stride,
+                bwd_head_last_stride=ctx.bwd_head_last_stride,
                 time_event=time_event,
             )
         if ctx.bwd_event_sync:
             time_event.synchronize()
-        # forward takes 16 args excluding ctx. return 3 grad + 13 None
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None
+        # forward takes 17 args excluding ctx. return 3 grad + 14 None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 class ConditionalLlamaRingFlashAttnFunc(torch.autograd.Function):
@@ -1352,7 +1356,8 @@ def cond_llama_flash_attn_func(
     heads_k_stride: int = 1,
     head_first_stride: Optional[int] = None,
     pack_first_stride: bool = True,
-    head_last_stride: Optional[int] = None,
+    bwd_head_first_stride: Optional[int] = None,
+    bwd_head_last_stride: Optional[int] = None,
     dropout_p: float = 0.0,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
@@ -1375,7 +1380,8 @@ def cond_llama_flash_attn_func(
         heads_k_stride,
         head_first_stride,
         pack_first_stride,
-        head_last_stride,
+        bwd_head_first_stride,
+        bwd_head_last_stride,
         dropout_p,
         softmax_scale,
         causal,
