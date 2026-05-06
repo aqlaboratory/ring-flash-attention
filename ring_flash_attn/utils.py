@@ -173,7 +173,6 @@ class ReduceScatterHandleManager:
         self,
         group=None,
         group_name: Optional[str] = None,
-        device=None,
         use_coalesced: Optional[bool] = None,
     ):
         # Require torch.distributed to be initialized unless caller supplies
