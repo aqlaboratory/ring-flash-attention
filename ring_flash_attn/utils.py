@@ -169,27 +169,72 @@ class AllGatherComm:
 
 
 class ReduceScatterHandleManager:
-    def __init__(self, group=None, device=None, use_coalesced: Optional[bool] = None):
-        if group is None:
-            group = dist.group.WORLD
-        if group is None:
-            raise RuntimeError(
-                "ReduceScatterHandleManager requires an initialized process group"
-            )
-        self.group = group
-        self._world_size = dist.get_world_size(group)
+    def __init__(
+        self,
+        group=None,
+        group_name: Optional[str] = None,
+        device=None,
+        use_coalesced: Optional[bool] = None,
+    ):
+        # Require torch.distributed to be initialized unless caller supplies
+        # either an explicit group or an explicit group_name.
+        if not getattr(dist, "is_initialized", lambda: False)():
+            if group is None and group_name is None:
+                raise RuntimeError(
+                    "torch.distributed is not initialized; initialize it or pass `group` or `group_name`"
+                )
 
-        group_name = getattr(group, "group_name", None)
-        if callable(group_name):
-            group_name = group_name()
+        if group is None:
+            # prefer the default WORLD group when available
+            group = getattr(dist, "group", None)
+            if group is not None:
+                try:
+                    group = dist.group.WORLD
+                except Exception:
+                    group = None
+
+        self.group = group
+
+        # Resolve world size if possible (give a clearer error if it fails)
+        try:
+            if self.group is not None:
+                self._world_size = dist.get_world_size(self.group)
+            else:
+                # If no ProcessGroup object was supplied, require caller to have
+                # provided a group_name and rely on functional APIs to accept it.
+                raise RuntimeError("no process group available")
+        except Exception as e:
+            raise RuntimeError(
+                "failed to determine world size for provided group; pass a valid ProcessGroup or ensure torch.distributed is initialized"
+            ) from e
+
+        # Allow explicit override of the c10d functional group name to avoid
+        # fragile introspection of ProcessGroup internals.
         if group_name is None:
-            group_name = getattr(group, "name", None)
+            group_name = getattr(self.group, "group_name", None)
             if callable(group_name):
-                group_name = group_name()
+                try:
+                    group_name = group_name()
+                except TypeError:
+                    group_name = None
+
+        if group_name is None:
+            group_name = getattr(self.group, "name", None)
+            if callable(group_name):
+                try:
+                    group_name = group_name()
+                except TypeError:
+                    group_name = None
+
+        if group_name is None:
+            # some implementations expose a private attribute
+            group_name = getattr(self.group, "_group_name", None)
+
         if group_name is None:
             raise RuntimeError(
-                "Could not determine a process-group name for c10d functional collectives"
+                "Could not determine a process-group name for c10d functional collectives; pass explicit `group_name`"
             )
+
         self._group_name = group_name
 
         self._supports_coalesced = hasattr(
@@ -199,6 +244,7 @@ class ReduceScatterHandleManager:
             self._use_coalesced = self._supports_coalesced
         else:
             self._use_coalesced = use_coalesced and self._supports_coalesced
+
         self.pending = None
 
     def issue(
