@@ -171,10 +171,27 @@ class AllGatherComm:
 class ReduceScatterHandleManager:
     def __init__(self, group=None, device=None, use_coalesced: Optional[bool] = None):
         if group is None:
-            group = dist.distributed_c10d._get_default_group()
+            group = dist.group.WORLD
+        if group is None:
+            raise RuntimeError(
+                "ReduceScatterHandleManager requires an initialized process group"
+            )
         self.group = group
         self._world_size = dist.get_world_size(group)
-        self._group_name = group.group_name
+
+        group_name = getattr(group, "group_name", None)
+        if callable(group_name):
+            group_name = group_name()
+        if group_name is None:
+            group_name = getattr(group, "name", None)
+            if callable(group_name):
+                group_name = group_name()
+        if group_name is None:
+            raise RuntimeError(
+                "Could not determine a process-group name for c10d functional collectives"
+            )
+        self._group_name = group_name
+
         self._supports_coalesced = hasattr(
             torch.ops._c10d_functional, "reduce_scatter_tensor_coalesced"
         )
