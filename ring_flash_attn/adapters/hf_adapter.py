@@ -7,13 +7,13 @@ import torch.distributed as dist
 import transformers
 import transformers.modeling_flash_attention_utils
 try:
+    from transformers.utils import is_flash_attn_greater_or_equal
+    is_flash_attn_greater_or_equal_2_10 = is_flash_attn_greater_or_equal("2.1.0")
+except ImportError:
+    # legacy support
     from transformers.modeling_flash_attention_utils import (
         is_flash_attn_greater_or_equal_2_10,
     )
-except ImportError:
-    # transformers <= 4.53.x
-    from transformers.utils import is_flash_attn_greater_or_equal
-    is_flash_attn_greater_or_equal_2_10 = is_flash_attn_greater_or_equal("2.1.0")
 
 from ..llama3_flash_attn_varlen import (
     llama3_flash_attn_varlen_func,
