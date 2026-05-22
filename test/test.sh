@@ -17,6 +17,15 @@ tests=(
   test_llama_stride_flags.py
 )
 
+cpu_tests=(
+  test.test_reduce_scatter_handle_manager
+  test.test_llama_bwd_stride_flags
+)
+
+for test in "${cpu_tests[@]}"; do
+  python -m unittest "$test"
+done
+
 for test in "${tests[@]}"; do
   torchrun --nproc_per_node $num_gpus test/$test
 done
