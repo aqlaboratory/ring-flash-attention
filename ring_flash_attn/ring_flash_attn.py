@@ -2,6 +2,7 @@ import torch
 import torch.distributed as dist
 from flash_attn.flash_attn_interface import _flash_attn_forward, _flash_attn_backward
 from .utils import RingComm, update_out_and_lse, get_default_args
+from .triton.fused_attention import triton_flash_attn_backward
 import logging
 import gc
 import flash_attn
@@ -97,15 +98,21 @@ def ring_flash_attn_backward(
     alibi_slopes=None,
     deterministic=False,
     time_event=None,  # Sync GPU,CPU to lower vRAM allocation; no sync by default
+    use_triton_fp32_bwd=False,
+    enable_hip_opts=False,
 ):
     kv_comm = RingComm(process_group)
     d_kv_comm = RingComm(process_group)
     dq, dk, dv = None, None, None
     next_dk, next_dv = None, None
 
-    block_dq_buffer = torch.empty(q.shape, dtype=q.dtype, device=q.device)
-    block_dk_buffer = torch.empty(k.shape, dtype=k.dtype, device=k.device)
-    block_dv_buffer = torch.empty(v.shape, dtype=v.dtype, device=v.device)
+    # When the Triton fp32 backward is requested, allocate the per-step grad
+    # buffers in fp32 so the kernel can write directly without an intermediate
+    # downcast that would defeat the precision gain.
+    block_dtype = torch.float32 if use_triton_fp32_bwd else q.dtype
+    block_dq_buffer = torch.empty(q.shape, dtype=block_dtype, device=q.device)
+    block_dk_buffer = torch.empty(k.shape, dtype=block_dtype, device=k.device)
+    block_dv_buffer = torch.empty(v.shape, dtype=block_dtype, device=v.device)
 
     next_dk, next_dv = None, None
     next_k, next_v = None, None
@@ -147,8 +154,39 @@ def ring_flash_attn_backward(
                         "window_size_right": window_size[1],
                     }
                 )
-            # logging.debug(f"q {params['q'].shape} k {params['k'].shape} v {params['v'].shape} dout {params['dout'].shape} softmax_lse {params['softmax_lse'].shape}")            
-            _wrapped_flash_attn_backward(**params)
+            # logging.debug(f"q {params['q'].shape} k {params['k'].shape} v {params['v'].shape} dout {params['dout'].shape} softmax_lse {params['softmax_lse'].shape}")
+            if use_triton_fp32_bwd:
+                # Triton backward expects q/k/v/out/dout to share dtype and
+                # ignores the "return_softmax" knob, so build a clean kwarg set.
+                # window_size_left/right are honored as positional kwargs.
+                wsl = window_size[0]
+                wsr = window_size[1]
+                # The Triton backward needs the dtypes of q/k/v/out/dout to match.
+                # When upstream q is bf16/fp16, upcast for this step so the per-step
+                # gradient is computed in fp32 then accumulated; otherwise pass q-dtype.
+                if q.dtype == torch.float32:
+                    q_t, k_t, v_t, out_t, dout_t = q, k, v, out, dout
+                else:
+                    q_t = q.float()
+                    k_t = k.float()
+                    v_t = v.float()
+                    out_t = out.float()
+                    dout_t = dout.float()
+                triton_flash_attn_backward(
+                    dout_t, q_t, k_t, v_t, out_t, softmax_lse,
+                    block_dq_buffer, block_dk_buffer, block_dv_buffer,
+                    dropout_p=dropout_p,
+                    softmax_scale=softmax_scale,
+                    causal=bwd_causal,
+                    window_size_left=wsl,
+                    window_size_right=wsr,
+                    softcap=softcap,
+                    alibi_slopes=alibi_slopes,
+                    deterministic=deterministic,
+                    enable_hip_opts=enable_hip_opts,
+                )
+            else:
+                _wrapped_flash_attn_backward(**params)
 
             if dq is None:
                 dq = block_dq_buffer.to(torch.float32)
@@ -171,6 +209,10 @@ def ring_flash_attn_backward(
 
     d_kv_comm.wait()
 
+    # When using the Triton fp32 backward, honor the input dtype on the way out.
+    # The legacy path preserves its long-standing bf16 cast for dq.
+    if use_triton_fp32_bwd:
+        return dq.to(q.dtype), next_dk.to(q.dtype), next_dv.to(q.dtype)
     return dq.to(torch.bfloat16), next_dk.to(q.dtype), next_dv.to(q.dtype)
 
 
@@ -189,6 +231,8 @@ class RingFlashAttnFunc(torch.autograd.Function):
         deterministic,
         return_softmax,
         group,
+        use_triton_fp32_bwd,
+        enable_hip_opts,
     ):
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
@@ -217,6 +261,8 @@ class RingFlashAttnFunc(torch.autograd.Function):
         ctx.alibi_slopes = alibi_slopes
         ctx.deterministic = deterministic
         ctx.group = group
+        ctx.use_triton_fp32_bwd = use_triton_fp32_bwd
+        ctx.enable_hip_opts = enable_hip_opts
         return out if not return_softmax else (out, softmax_lse, None)
 
     @staticmethod
@@ -236,8 +282,10 @@ class RingFlashAttnFunc(torch.autograd.Function):
             window_size=ctx.window_size,
             alibi_slopes=ctx.alibi_slopes,
             deterministic=ctx.deterministic,
+            use_triton_fp32_bwd=ctx.use_triton_fp32_bwd,
+            enable_hip_opts=ctx.enable_hip_opts,
         )
-        return dq, dk, dv, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None
 
 
 def ring_flash_attn_qkvpacked_func(
@@ -250,6 +298,8 @@ def ring_flash_attn_qkvpacked_func(
     deterministic=False,
     return_attn_probs=False,
     group=None,
+    use_triton_fp32_bwd=False,
+    enable_hip_opts=False,
 ):
     return RingFlashAttnFunc.apply(
         qkv[:, :, 0],
@@ -263,6 +313,8 @@ def ring_flash_attn_qkvpacked_func(
         deterministic,
         return_attn_probs,
         group,
+        use_triton_fp32_bwd,
+        enable_hip_opts,
     )
 
 
@@ -277,6 +329,8 @@ def ring_flash_attn_kvpacked_func(
     deterministic=False,
     return_attn_probs=False,
     group=None,
+    use_triton_fp32_bwd=False,
+    enable_hip_opts=False,
 ):
     return RingFlashAttnFunc.apply(
         q,
@@ -290,6 +344,8 @@ def ring_flash_attn_kvpacked_func(
         deterministic,
         return_attn_probs,
         group,
+        use_triton_fp32_bwd,
+        enable_hip_opts,
     )
 
 
@@ -305,6 +361,8 @@ def ring_flash_attn_func(
     deterministic=False,
     return_attn_probs=False,
     group=None,
+    use_triton_fp32_bwd=False,
+    enable_hip_opts=False,
 ):
     return RingFlashAttnFunc.apply(
         q,
@@ -318,4 +376,6 @@ def ring_flash_attn_func(
         deterministic,
         return_attn_probs,
         group,
+        use_triton_fp32_bwd,
+        enable_hip_opts,
     )

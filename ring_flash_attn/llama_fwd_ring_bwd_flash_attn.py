@@ -2,6 +2,7 @@ import torch
 import torch.distributed as dist
 from flash_attn.flash_attn_interface import _flash_attn_forward, _flash_attn_backward
 from .ring_flash_attn import ring_flash_attn_backward
+from .triton.fused_attention import triton_flash_attn_backward
 from einops import rearrange
 from typing import Optional, Tuple
 from .utils import (
@@ -261,6 +262,8 @@ def llama_flash_attn_backward(
     bwd_head_first_stride: Optional[int] = None,
     bwd_head_last_stride: Optional[int] = None,
     time_event=None,
+    use_triton_fp32_bwd: bool = False,
+    enable_hip_opts: bool = False,
 ):
     """
     Llama-style flash attention backward pass.
@@ -387,9 +390,12 @@ def llama_flash_attn_backward(
 
     # flash_attn_backward writes to a width-specific dkv_buffer (k.dtype, since FA requires it).
     # One per unique width is enough — flash_attn_backward is sync, so we don't pipeline its writes.
+    # When the Triton fp32 backward is selected, the per-step kernel writes fp32 directly,
+    # so dq and the dkv_buf both live in fp32.
+    grad_dtype = torch.float32 if use_triton_fp32_bwd else k.dtype
     unique_widths = set(stride_pattern)
     dkv_buf_by_width = {
-        w: torch.empty(dkv_shape(w), dtype=k.dtype, device=k.device)
+        w: torch.empty(dkv_shape(w), dtype=grad_dtype, device=k.device)
         for w in unique_widths
     }
 
@@ -399,7 +405,7 @@ def llama_flash_attn_backward(
         for w in unique_widths
     }
 
-    dq = torch.empty_like(q)
+    dq = torch.empty(q.shape, dtype=grad_dtype, device=q.device)
     dk = torch.empty_like(k)
     dv = torch.empty_like(v)
 
@@ -490,26 +496,50 @@ def llama_flash_attn_backward(
             dk_i = dkv_buf[0]
             dv_i = dkv_buf[1]
 
-        params = {
-            "dout": dout_i,
-            "q": q_i,
-            "k": k_i,
-            "v": v_i,
-            "out": out_i,
-            "softmax_lse": lse_i,
-            "dq": dq_i,
-            "dk": dk_i,
-            "dv": dv_i,
-            "dropout_p": dropout_p,
-            "softmax_scale": softmax_scale,
-            "causal": causal,
-            "window_size_left": window_size[0],
-            "window_size_right": window_size[1],
-            "softcap": softcap,
-            "alibi_slopes": alibi_slopes,
-            "deterministic": deterministic,
-        }
-        _wrapped_flash_attn_backward(**params)
+        if use_triton_fp32_bwd:
+            # All Triton kernel inputs must share dtype; upcast non-fp32 inputs.
+            if q_i.dtype == torch.float32:
+                q_t, k_t, v_t, out_t, dout_t = q_i, k_i, v_i, out_i, dout_i
+            else:
+                q_t = q_i.float()
+                k_t = k_i.float()
+                v_t = v_i.float()
+                out_t = out_i.float()
+                dout_t = dout_i.float()
+            triton_flash_attn_backward(
+                dout_t, q_t, k_t, v_t, out_t, lse_i,
+                dq_i, dk_i, dv_i,
+                dropout_p=dropout_p,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size_left=window_size[0],
+                window_size_right=window_size[1],
+                softcap=softcap,
+                alibi_slopes=alibi_slopes,
+                deterministic=deterministic,
+                enable_hip_opts=enable_hip_opts,
+            )
+        else:
+            params = {
+                "dout": dout_i,
+                "q": q_i,
+                "k": k_i,
+                "v": v_i,
+                "out": out_i,
+                "softmax_lse": lse_i,
+                "dq": dq_i,
+                "dk": dk_i,
+                "dv": dv_i,
+                "dropout_p": dropout_p,
+                "softmax_scale": softmax_scale,
+                "causal": causal,
+                "window_size_left": window_size[0],
+                "window_size_right": window_size[1],
+                "softcap": softcap,
+                "alibi_slopes": alibi_slopes,
+                "deterministic": deterministic,
+            }
+            _wrapped_flash_attn_backward(**params)
         del k_i, v_i, q_i, dout_i, out_i
 
         # Drain previous iteration's reduce_scatter after compute to keep issue/wait cadence.
@@ -530,6 +560,12 @@ def llama_flash_attn_backward(
     # ---- Drain the final reduce_scatter ----
     rs_manager.drain_to(dk, dv)
 
+    # When the Triton fp32 path is on, dq is fp32 while the caller (autograd
+    # Function) expects gradients matching q.dtype. dk/dv are already in
+    # k.dtype because drain_to writes into the k-dtype dk/dv buffers from the
+    # fp32 scatter result.
+    if use_triton_fp32_bwd and dq.dtype != q.dtype:
+        dq = dq.to(q.dtype)
     return dq, dk, dv
 
 
@@ -562,42 +598,15 @@ class LlamaRingFlashAttnFunc(torch.autograd.Function):
         return_softmax: bool,
         group: dist.ProcessGroup,
         bwd_event_sync: bool,
+        use_triton_fp32_bwd: bool,
+        enable_hip_opts: bool,
     ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor, None]:
-        """
-        Forward pass for Llama-style ring attention.
-        For loop in llama_flash_attn_forward could lead to early allocation of tensors
-        by the CPU, leading to memory explosion. CUDA event syncing can control this.
-        Let parent model handle forward event syncing for efficiency.
-
-        Args:
-            ctx: The context object for autograd.
-            q (torch.Tensor): Query tensor.
-            k (torch.Tensor): Key tensor.
-            v (torch.Tensor): Value tensor.
-            heads_k_stride (int): Stride for key/value heads in GQA/MQA.
-            head_first_stride (Optional[int]): A different stride for the first group of heads.
-            pack_first_stride (bool): Whether to pack the first stride of key and value.
-            dropout_p (float): Dropout probability.
-            softmax_scale (Optional[float]): Scale factor for softmax. If None, calculated from head dimension.
-            causal (bool): Whether to apply causal masking.
-            window_size (Tuple[int, int]): Sliding window size.
-            alibi_slopes (Optional[torch.Tensor]): ALiBi slopes for positional bias.
-            deterministic (bool): Whether to use deterministic algorithms.
-            return_softmax (bool): Whether to return the softmax log-sum-exp.
-            group (dist.ProcessGroup): The distributed process group.
-            bwd_event_sync (bool): If True, syncs a CUDA event in the backward pass to control memory allocation.
-
-        Returns:
-            Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, None]]: The attention output, and optionally the LSE and a None placeholder.
-        """
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
 
         assert alibi_slopes is None
         k = k.contiguous()
         v = v.contiguous()
-        # out shape (batch, seq, heads, head_dim)
-        # softmax_lse shape (batch, seq, heads)
         out, softmax_lse = llama_flash_attn_forward(
             group,
             q,
@@ -622,6 +631,8 @@ class LlamaRingFlashAttnFunc(torch.autograd.Function):
         ctx.deterministic = deterministic
         ctx.group = group
         ctx.bwd_event_sync = bwd_event_sync
+        ctx.use_triton_fp32_bwd = use_triton_fp32_bwd
+        ctx.enable_hip_opts = enable_hip_opts
         return out if not return_softmax else (out, softmax_lse, None)
 
     @staticmethod
@@ -630,19 +641,6 @@ class LlamaRingFlashAttnFunc(torch.autograd.Function):
         dout: torch.Tensor,
         *args,
     ) -> Tuple[Optional[torch.Tensor], ...]:
-        """
-        Backward pass for Llama-style ring attention.
-
-        Uses `ring_flash_attn_backward`.
-
-        Args:
-            ctx: The context object for autograd.
-            dout (torch.Tensor): Gradient of the output.
-            *args: Other gradients.
-
-        Returns:
-            Tuple[Optional[torch.Tensor], ...]: Gradients for the inputs of the forward pass.
-        """
         time_event = None
         if ctx.bwd_event_sync:
             time_event = torch.cuda.Event(enable_timing=False)
@@ -662,11 +660,13 @@ class LlamaRingFlashAttnFunc(torch.autograd.Function):
             alibi_slopes=ctx.alibi_slopes,
             deterministic=ctx.deterministic,
             time_event=time_event,
+            use_triton_fp32_bwd=ctx.use_triton_fp32_bwd,
+            enable_hip_opts=ctx.enable_hip_opts,
         )
         if ctx.bwd_event_sync:
             time_event.synchronize()
-        # forward takes 15 args excluding ctx. return 3 grad + 12 None
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None
+        # forward takes 17 args excluding ctx. return 3 grad + 14 None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 class LlamaFlashAttnFunc(torch.autograd.Function):
     """
@@ -692,6 +692,8 @@ class LlamaFlashAttnFunc(torch.autograd.Function):
         return_softmax: bool,
         group: dist.ProcessGroup,
         bwd_event_sync: bool,
+        use_triton_fp32_bwd: bool,
+        enable_hip_opts: bool,
     ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor, None]:
         """
         Forward pass for Llama-style ring attention.
@@ -755,6 +757,8 @@ class LlamaFlashAttnFunc(torch.autograd.Function):
         ctx.heads_k_stride = heads_k_stride
         ctx.bwd_head_first_stride = bwd_head_first_stride
         ctx.bwd_head_last_stride = bwd_head_last_stride
+        ctx.use_triton_fp32_bwd = use_triton_fp32_bwd
+        ctx.enable_hip_opts = enable_hip_opts
         return out if not return_softmax else (out, softmax_lse, None)
 
     @staticmethod
@@ -781,11 +785,13 @@ class LlamaFlashAttnFunc(torch.autograd.Function):
             bwd_head_first_stride=ctx.bwd_head_first_stride,
             bwd_head_last_stride=ctx.bwd_head_last_stride,
             time_event=time_event,
+            use_triton_fp32_bwd=ctx.use_triton_fp32_bwd,
+            enable_hip_opts=ctx.enable_hip_opts,
         )
         if ctx.bwd_event_sync:
             time_event.synchronize()
-        # forward takes 17 args excluding ctx. return 3 grad + 14 None
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None
+        # forward takes 19 args excluding ctx. return 3 grad + 16 None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 def llama_fwd_ring_bwd_flash_attn_func(
@@ -804,6 +810,8 @@ def llama_fwd_ring_bwd_flash_attn_func(
     return_attn_probs: bool = False,
     group: Optional[dist.ProcessGroup] = None,
     bwd_event_sync: bool = False,
+    use_triton_fp32_bwd: bool = False,
+    enable_hip_opts: bool = False,
 ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor, None]:
     """
     Performs Llama-style ring flash attention with a custom backward pass.
@@ -859,6 +867,8 @@ def llama_fwd_ring_bwd_flash_attn_func(
         return_attn_probs,
         group,
         bwd_event_sync,
+        use_triton_fp32_bwd,
+        enable_hip_opts,
     )
 
 def llama_flash_attn_func(
@@ -879,6 +889,8 @@ def llama_flash_attn_func(
     return_attn_probs: bool = False,
     group: Optional[dist.ProcessGroup] = None,
     bwd_event_sync: bool = False,
+    use_triton_fp32_bwd: bool = False,
+    enable_hip_opts: bool = False,
 ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor, None]:
     # logging.debug(f"q {q[0,:2,3,:4]}")
     return LlamaFlashAttnFunc.apply(
@@ -899,6 +911,8 @@ def llama_flash_attn_func(
         return_attn_probs,
         group,
         bwd_event_sync,
+        use_triton_fp32_bwd,
+        enable_hip_opts,
     )
 
 from .llama3_flash_attn_varlen import llama3_flash_attn_varlen_backward, llama3_flash_attn_varlen_forward, llama3_flash_attn_prepare_cu_seqlens, Llama3FlashAttnVarlenFunc
@@ -1273,15 +1287,22 @@ class ConditionalLlamaRingFlashAttnFunc(torch.autograd.Function):
         ctx.deterministic = deterministic
         ctx.group = group
         ctx.heads_k_stride = heads_k_stride
+        # The ring delegate (LlamaRingFlashAttnFunc.backward) now reads these
+        # from ctx; this conditional wrapper does not expose them as inputs.
+        ctx.use_triton_fp32_bwd = False
+        ctx.enable_hip_opts = False
         return out if not return_softmax else (out, softmax_lse, None)
 
     @staticmethod
     def backward(ctx, dout, *args):
-
         if ctx.group is None:
-            return ConditionalLlamaFlashAttnFunc.backward(ctx, dout, *args)
+            res = ConditionalLlamaFlashAttnFunc.backward(ctx, dout, *args)
         else:
-            return LlamaRingFlashAttnFunc.backward(ctx, dout, *args)
+            res = LlamaRingFlashAttnFunc.backward(ctx, dout, *args)
+        # ConditionalLlamaRingFlashAttnFunc.forward takes 15 args excluding ctx;
+        # the delegates may return more (LlamaRingFlashAttnFunc returns 17 now).
+        # Trim trailing None grads to match this function's input arity.
+        return res[:15]
 
 
 

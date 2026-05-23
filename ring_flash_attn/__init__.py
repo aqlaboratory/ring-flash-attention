@@ -38,3 +38,4 @@ from .adapters import (
     substitute_hf_flash_attn,
     update_ring_flash_attn_params,
 )
+from .triton.fused_attention import triton_flash_attn_backward

@@ -150,6 +150,27 @@ torchrun --nproc_per_node 8 benchmark/benchmark_kvpacked_func.py
 torchrun --nproc_per_node 8 benchmark/benchmark_varlen_kvpacked_func.py
 ```
 
+Single-GPU comparison of the Triton fp32 backward against flash-attn's CUDA
+backward (used by `use_triton_fp32_bwd=True` on `ring_flash_attn_*_func` /
+`llama_flash_attn_func` / `llama_fwd_ring_bwd_flash_attn_func`):
+
+```bash
+# Full grid: bf16/fp16/fp32 across several seqlens, Llama-3-8B head config.
+python benchmark/benchmark_triton_vs_flash_attn_backward.py
+
+# A single seqlen + dtype, with causal masking:
+python benchmark/benchmark_triton_vs_flash_attn_backward.py \
+    --seqlen 4096 --dtype bf16 --causal
+```
+
+Reports ms / iter, TFLOPS, tokens/sec, and the flash-attn-vs-Triton speedup
+ratio per shape and dtype. The Triton backward is expected to be slower than
+the flash-attn CUDA kernel at fp16/bf16; the point of the fp32 mode is the
+precision win (no flash-attn equivalent — its CUDA backward rejects fp32
+inputs). See
+`test/test_triton_flash_attn_backward.py::test_fp32_strictly_more_accurate_than_bf16`
+for a head-to-head precision comparison against an fp32 PyTorch reference.
+
 ### Known Limitations
 
 There are some arithmetic errors with the current implementation. The reason for them is probably that flash attention will return bf16 value for each block, so we cannot accumluate the values with the original fp32 ones.
