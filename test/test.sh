@@ -14,7 +14,17 @@ tests=(
   test_zigzag_ring_flash_attn_varlen_func.py
   test_cond_llama_fwd_ring_bwd_flash_attn.py
   test_pack_first_stride.py
+  test_llama_stride_flags.py
 )
+
+cpu_tests=(
+  test.test_reduce_scatter_handle_manager
+  test.test_llama_bwd_stride_flags
+)
+
+for test in "${cpu_tests[@]}"; do
+  python -m unittest "$test"
+done
 
 for test in "${tests[@]}"; do
   torchrun --nproc_per_node $num_gpus test/$test
