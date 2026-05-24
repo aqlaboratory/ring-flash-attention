@@ -331,6 +331,114 @@ def _bwd_kernel_one_col_block(
     )
 
 
+def _init_to_zero(name):
+    """Pre-hook factory: zero a kernel buffer between autotune trials and at
+    the start of every chosen-config kernel launch. We use this for DQ because
+    the kernel does read-modify-write accumulation (load + dot + store)."""
+    def hook(nargs):
+        nargs[name].zero_()
+    return hook
+
+
+# Autotune sweep. Triton skips configs that exceed shared memory on the target
+# device, so it's safe to list larger tiles even on consumer GPUs. The keys
+# bucket seqlen (CACHE_KEY_*) into multiples of 32 so similar shapes share a
+# pick rather than retuning every call.
+_AUTOTUNE_CONFIGS = [
+    triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_warps=4, num_stages=1,
+                  pre_hook=_init_to_zero("DQ")),
+    triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_warps=4, num_stages=2,
+                  pre_hook=_init_to_zero("DQ")),
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 32}, num_warps=4, num_stages=1,
+                  pre_hook=_init_to_zero("DQ")),
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 32}, num_warps=4, num_stages=2,
+                  pre_hook=_init_to_zero("DQ")),
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=1,
+                  pre_hook=_init_to_zero("DQ")),
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=2,
+                  pre_hook=_init_to_zero("DQ")),
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=8, num_stages=1,
+                  pre_hook=_init_to_zero("DQ")),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 32}, num_warps=4, num_stages=1,
+                  pre_hook=_init_to_zero("DQ")),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=8, num_stages=1,
+                  pre_hook=_init_to_zero("DQ")),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_warps=8, num_stages=1,
+                  pre_hook=_init_to_zero("DQ")),
+]
+
+
+_MAX_SHARED_MEM_CACHE = None
+
+
+def _get_max_shared_mem():
+    """Return the largest per-CTA shared memory in bytes the kernel can use,
+    honoring opt-in on consumer cards. Cached after first call."""
+    global _MAX_SHARED_MEM_CACHE
+    if _MAX_SHARED_MEM_CACHE is not None:
+        return _MAX_SHARED_MEM_CACHE
+    try:
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        _MAX_SHARED_MEM_CACHE = getattr(
+            props, "shared_memory_per_block_optin", props.shared_memory_per_block
+        )
+    except Exception:
+        _MAX_SHARED_MEM_CACHE = 49152
+    return _MAX_SHARED_MEM_CACHE
+
+
+def _estimate_smem(BM, BN, headdim, elem_size):
+    """Conservative SMEM estimate per CTA in bytes.
+
+    The bwd kernel keeps K/V resident in SMEM, and during each Q-row iteration
+    materializes Q, DO (input dtype), QK and P (fp32), plus dk/dv/dq fp32
+    accumulators. Triton's liveness analysis may overlap some of these; this
+    estimate is a strict upper bound so we err on the side of pruning.
+    """
+    return (
+        2 * BN * headdim * elem_size      # K, V resident
+        + 2 * BM * headdim * elem_size    # Q, DO per iter
+        + 2 * BM * BN * 4                 # QK, P fp32
+        + 2 * BN * headdim * 4            # dk, dv fp32 accumulators
+        + BM * headdim * 4                # dq fp32 RMW
+    )
+
+
+def _prune_invalid_configs(configs, named_args, **kwargs):
+    """Drop configs that (a) exceed the call shape or (b) overflow shared mem."""
+    seqlen_q = kwargs.get("seqlen_q", named_args.get("seqlen_q"))
+    seqlen_k = kwargs.get("seqlen_k", named_args.get("seqlen_k"))
+    headdim = kwargs.get("BLOCK_HEADDIM", named_args.get("BLOCK_HEADDIM"))
+    dot_precision = kwargs.get("DOT_PRECISION", named_args.get("DOT_PRECISION", "tf32"))
+    elem_size = 4 if dot_precision == "ieee" else 2
+    max_smem = _get_max_shared_mem()
+    out = []
+    for c in configs:
+        bm = c.kwargs["BLOCK_M"]
+        bn = c.kwargs["BLOCK_N"]
+        if seqlen_q is not None and bm > max(seqlen_q, 32):
+            continue
+        if seqlen_k is not None and bn > max(seqlen_k, 32):
+            continue
+        if headdim is not None:
+            est = _estimate_smem(bm, bn, headdim, elem_size)
+            if est > max_smem:
+                continue
+        out.append(c)
+    if not out:
+        # Always return at least the smallest config so autotune has something
+        # to try. The wrapper will error on launch if even this OORs.
+        smallest = min(configs, key=lambda c: c.kwargs["BLOCK_M"] * c.kwargs["BLOCK_N"])
+        return [smallest]
+    return out
+
+
+@triton.autotune(
+    configs=_AUTOTUNE_CONFIGS,
+    key=["CACHE_KEY_SEQLEN_Q", "CACHE_KEY_SEQLEN_K", "IS_CAUSAL",
+         "BLOCK_HEADDIM", "DOT_PRECISION"],
+    prune_configs_by={"early_config_prune": _prune_invalid_configs},
+)
 @triton.heuristics(
     {
         "EVEN_M": lambda args: args["seqlen_q"] % args["BLOCK_M"] == 0,
@@ -380,6 +488,8 @@ def _bwd_kernel(
     seqlen_k,
     seqlen_q_rounded,
     headdim,
+    CACHE_KEY_SEQLEN_Q,
+    CACHE_KEY_SEQLEN_K,
     BIAS_TYPE: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     BLOCK_HEADDIM: tl.constexpr,
@@ -516,16 +626,20 @@ def triton_flash_attn_backward(
     non-default value, because silent ignore would produce wrong gradients:
     ``dropout_p > 0``, ``alibi_slopes is not None``, ``softcap > 0``,
     or any non-default ``window_size_*``. ``deterministic`` is accepted
-    (the default ``SEQUENCE_PARALLEL=False`` autotune config is already
-    deterministic; the ``SEQUENCE_PARALLEL=True`` config uses ``atomic_add``
-    on dq but Triton autotune may still pick it — for strict determinism
-    callers should set ``deterministic=True`` and we will force the
-    non-parallel config).
+    (SEQUENCE_PARALLEL is hard-coded to False — no atomic-add on dq).
 
-    When ``enable_hip_opts=True`` and a HIP/ROCm backend is detected, the
-    kernel launch passes ``waves_per_eu`` and ``allow_flush_denorm``. This
-    is the only AMD-specific code path; with the flag off (the default) the
-    kernel is launched with backend-agnostic kwargs.
+    Block sizes, num_warps, and num_stages are chosen by ``@triton.autotune``
+    keyed on the dtype and (bucketed) sequence lengths. The first call for a
+    given shape/dtype combo therefore pays an autotune cost (~seconds); after
+    that the choice is cached for the process lifetime. Set
+    ``TRITON_PRINT_AUTOTUNING=1`` in the environment to log which config was
+    picked — useful when tuning the config list for new hardware.
+
+    ``enable_hip_opts`` is an experimental knob that, when set on a HIP/ROCm
+    backend, adds ``waves_per_eu`` and ``allow_flush_denorm`` to the kernel
+    launch (the AMD-tuning idiom from experiments/evoformer.py). Early MI300A
+    testing showed this REGRESSED throughput vs the backend-agnostic launch,
+    so it is OFF by default. Benchmark before enabling on your hardware.
     """
     if dropout_p > 0.0:
         raise NotImplementedError(
@@ -583,27 +697,18 @@ def triton_flash_attn_backward(
         lse_for_kernel = softmax_lse.to(torch.float32) if softmax_lse.dtype != torch.float32 else softmax_lse
 
     # dq_accum is read-modify-written by the kernel (when SEQUENCE_PARALLEL=False)
-    # via load/store with eviction_policy='evict_last'; must be zero-initialized.
-    dq_accum = torch.zeros_like(q, dtype=torch.float32)
+    # via load/store with eviction_policy='evict_last'. The autotune pre_hook
+    # zeros it before every kernel launch (and between autotune trials), so
+    # we can allocate uninitialized here.
+    dq_accum = torch.empty_like(q, dtype=torch.float32)
     delta = torch.empty((batch, nheads, seqlen_q_rounded), device=q.device, dtype=torch.float32)
 
     BLOCK_HEADDIM = max(triton.next_power_of_2(d), 16)
-    # Block sizes tuned by element size and per-CTA shared memory budget.
-    # fp32 tiles need 4x the SRAM of fp16/bf16, so we shrink for fp32.
-    # On consumer Ada (sm_89, ~99 KB shared/CTA) the upstream 128x128 bf16
-    # config also OOMs, so we default to 64x64 there too. A100/H100 with
-    # >=160 KB could safely run 128x128 — that's a future tuning win.
-    if q.dtype == torch.float32:
-        BLOCK_M, BLOCK_N = 32, 32
-        num_warps = 4
-        # Use IEEE-754 fp32 matmul, not TF32 (default on Ampere+).
-        dot_precision = "ieee"
-    else:
-        BLOCK_M, BLOCK_N = 64, 64
-        num_warps = 4
-        # input_precision is ignored for fp16/bf16; pass tf32 as a no-op default.
-        dot_precision = "tf32"
-    num_stages = 1
+    # BLOCK_M/BLOCK_N/num_warps/num_stages are chosen by @triton.autotune.
+    # DOT_PRECISION is a constexpr we set from the input dtype: fp32 needs
+    # 'ieee' to bypass Triton's default TF32 fast-path; for fp16/bf16 the
+    # field is a no-op (tf32 is conventional here).
+    dot_precision = "ieee" if q.dtype == torch.float32 else "tf32"
     SEQUENCE_PARALLEL = False  # deterministic (no atomic_add on dq)
 
     pre_grid = lambda META: (triton.cdiv(seqlen_q, META["BLOCK_M"]), batch * nheads)
@@ -632,7 +737,9 @@ def triton_flash_attn_backward(
         extra_kern_args["waves_per_eu"] = 3 if d <= 64 else 2
         extra_kern_args["allow_flush_denorm"] = True
 
-    grid = (triton.cdiv(seqlen_k, BLOCK_N) if SEQUENCE_PARALLEL else 1, batch * nheads)
+    # SEQUENCE_PARALLEL=False -> grid is (1, batch*nheads); the kernel walks
+    # the seqlen_k dimension internally. seqlen //32 buckets the autotune key.
+    grid = (1, batch * nheads)
     _bwd_kernel[grid](
         q,
         k,
@@ -672,15 +779,13 @@ def triton_flash_attn_backward(
         seqlen_k,
         seqlen_q_rounded,
         d,
+        seqlen_q // 32,             # CACHE_KEY_SEQLEN_Q
+        seqlen_k // 32,             # CACHE_KEY_SEQLEN_K
         "none",                     # BIAS_TYPE
         causal,
         BLOCK_HEADDIM,
         SEQUENCE_PARALLEL,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
         DOT_PRECISION=dot_precision,
-        num_warps=num_warps,
-        num_stages=num_stages,
         **extra_kern_args,
     )
     # Land the fp32 dq accumulator into the caller's buffer (whatever dtype).
