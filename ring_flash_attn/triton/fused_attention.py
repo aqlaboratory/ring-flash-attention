@@ -238,11 +238,17 @@ def _bwd_kernel_one_col_block(
             qk = qk * softmax_scale + bias
         if not (EVEN_M & EVEN_HEADDIM):
             tl.debug_barrier()
-        lse_i = tl.load(LSE + offs_m_curr)
+        # Base-2 softmax: exp2 typically lowers to a single hardware op on both
+        # AMD and NVIDIA, while tl.exp expands to exp2(x*log2(e)). Pre-multiply
+        # the scale and the loaded LSE (which is stored in natural log by the
+        # forward) by RCP_LN2 = log2(e) so we can use exp2 directly.
+        RCP_LN2: tl.constexpr = 1.4426950408889634
+        lse_i = tl.load(LSE + offs_m_curr) * RCP_LN2
         if BIAS_TYPE == "none":
-            p = tl.exp(qk * softmax_scale - lse_i[:, None])
+            p = tl.math.exp2(qk * (softmax_scale * RCP_LN2) - lse_i[:, None])
         else:
-            p = tl.exp(qk - lse_i[:, None])
+            # bias path already folded scale into qk; just rebase to log2.
+            p = tl.math.exp2(qk * RCP_LN2 - lse_i[:, None])
         if EVEN_M & EVEN_HEADDIM:
             do = tl.load(do_ptrs)
         else:
@@ -387,20 +393,19 @@ def _get_max_shared_mem():
     return _MAX_SHARED_MEM_CACHE
 
 
-def _estimate_smem(BM, BN, headdim, elem_size):
-    """Conservative SMEM estimate per CTA in bytes.
+def _estimate_smem(BM, BN, headdim, elem_size, num_stages):
+    """SMEM estimate per CTA in bytes.
 
-    The bwd kernel keeps K/V resident in SMEM, and during each Q-row iteration
-    materializes Q, DO (input dtype), QK and P (fp32), plus dk/dv/dq fp32
-    accumulators. Triton's liveness analysis may overlap some of these; this
-    estimate is a strict upper bound so we err on the side of pruning.
+    The bwd kernel keeps K/V resident in SMEM and stages Q/DO across iterations
+    (num_stages copies for software pipelining). QK/P are a scratch tile in
+    SMEM. The dk/dv accumulators and dq RMW pattern live in registers, not
+    SMEM, so they're not counted here. This is still slightly conservative
+    because Triton's liveness analysis can overlap K/V with Q/DO stages.
     """
     return (
-        2 * BN * headdim * elem_size      # K, V resident
-        + 2 * BM * headdim * elem_size    # Q, DO per iter
-        + 2 * BM * BN * 4                 # QK, P fp32
-        + 2 * BN * headdim * 4            # dk, dv fp32 accumulators
-        + BM * headdim * 4                # dq fp32 RMW
+        2 * BN * headdim * elem_size              # K, V resident
+        + num_stages * 2 * BM * headdim * elem_size  # Q, DO staged
+        + 2 * BM * BN * 4                         # QK, P scratch (fp32)
     )
 
 
@@ -421,7 +426,7 @@ def _prune_invalid_configs(configs, named_args, **kwargs):
         if seqlen_k is not None and bn > max(seqlen_k, 32):
             continue
         if headdim is not None:
-            est = _estimate_smem(bm, bn, headdim, elem_size)
+            est = _estimate_smem(bm, bn, headdim, elem_size, c.num_stages)
             if est > max_smem:
                 continue
         out.append(c)
@@ -444,6 +449,14 @@ def _prune_invalid_configs(configs, named_args, **kwargs):
         "EVEN_M": lambda args: args["seqlen_q"] % args["BLOCK_M"] == 0,
         "EVEN_N": lambda args: args["seqlen_k"] % args["BLOCK_N"] == 0,
         "EVEN_HEADDIM": lambda args: args["headdim"] == args["BLOCK_HEADDIM"],
+        # AMD alignment hints: vector load width depends on stride divisibility.
+        # These are compile-time constexpr so unmet conditions cost nothing.
+        "HEADDIM_DIV_16": lambda args: args["headdim"] % 16 == 0,
+        "HEADDIM_DIV_8":  lambda args: args["headdim"] % 8 == 0,
+        "SEQLEN_Q_DIV_16": lambda args: args["seqlen_q"] % 16 == 0,
+        "SEQLEN_Q_DIV_8":  lambda args: args["seqlen_q"] % 8 == 0,
+        "SEQLEN_K_DIV_16": lambda args: args["seqlen_k"] % 16 == 0,
+        "SEQLEN_K_DIV_8":  lambda args: args["seqlen_k"] % 8 == 0,
     }
 )
 @triton.jit
@@ -497,10 +510,91 @@ def _bwd_kernel(
     EVEN_M: tl.constexpr,
     EVEN_N: tl.constexpr,
     EVEN_HEADDIM: tl.constexpr,
+    HEADDIM_DIV_16: tl.constexpr,
+    HEADDIM_DIV_8: tl.constexpr,
+    SEQLEN_Q_DIV_16: tl.constexpr,
+    SEQLEN_Q_DIV_8: tl.constexpr,
+    SEQLEN_K_DIV_16: tl.constexpr,
+    SEQLEN_K_DIV_8: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
 ):
+    # --- Integer-range and alignment hints ---
+    # tl.assume narrows the value range the compiler reasons about, which
+    # tightens address-calc codegen on AMD's integer pipe. tl.multiple_of
+    # promises strides are multiples of N elements, enabling
+    # global_load_dwordx{2,4} (8/16-byte vector loads). All conditions here
+    # are constexpr — unmet ones cost nothing.
+    tl.assume(stride_qb > 0)
+    tl.assume(stride_qh > 0)
+    tl.assume(stride_qm > 0)
+    tl.assume(stride_kb > 0)
+    tl.assume(stride_kh > 0)
+    tl.assume(stride_kn > 0)
+    tl.assume(stride_vb > 0)
+    tl.assume(stride_vh > 0)
+    tl.assume(stride_vn > 0)
+    tl.assume(stride_dob > 0)
+    tl.assume(stride_doh > 0)
+    tl.assume(stride_dom > 0)
+    tl.assume(stride_dqb > 0)
+    tl.assume(stride_dqh > 0)
+    tl.assume(stride_dqm > 0)
+    tl.assume(stride_dkb > 0)
+    tl.assume(stride_dkh > 0)
+    tl.assume(stride_dkn > 0)
+    tl.assume(stride_dvb > 0)
+    tl.assume(stride_dvh > 0)
+    tl.assume(stride_dvn > 0)
+    tl.assume(seqlen_q > 0)
+    tl.assume(seqlen_k > 0)
+    tl.assume(nheads > 0)
+
+    # In (B, S, H, D) layout, the head stride equals D. When D % 16 == 0,
+    # the seq stride (H*D) and batch stride (S*H*D) inherit that alignment.
+    if HEADDIM_DIV_16:
+        stride_qh = tl.multiple_of(stride_qh, 16)
+        stride_kh = tl.multiple_of(stride_kh, 16)
+        stride_vh = tl.multiple_of(stride_vh, 16)
+        stride_doh = tl.multiple_of(stride_doh, 16)
+        stride_dqh = tl.multiple_of(stride_dqh, 16)
+        stride_dkh = tl.multiple_of(stride_dkh, 16)
+        stride_dvh = tl.multiple_of(stride_dvh, 16)
+        stride_qm = tl.multiple_of(stride_qm, 16)
+        stride_kn = tl.multiple_of(stride_kn, 16)
+        stride_vn = tl.multiple_of(stride_vn, 16)
+        stride_dom = tl.multiple_of(stride_dom, 16)
+        stride_dqm = tl.multiple_of(stride_dqm, 16)
+        stride_dkn = tl.multiple_of(stride_dkn, 16)
+        stride_dvn = tl.multiple_of(stride_dvn, 16)
+    elif HEADDIM_DIV_8:
+        stride_qh = tl.multiple_of(stride_qh, 8)
+        stride_kh = tl.multiple_of(stride_kh, 8)
+        stride_vh = tl.multiple_of(stride_vh, 8)
+        stride_doh = tl.multiple_of(stride_doh, 8)
+        stride_dqh = tl.multiple_of(stride_dqh, 8)
+        stride_dkh = tl.multiple_of(stride_dkh, 8)
+        stride_dvh = tl.multiple_of(stride_dvh, 8)
+        stride_qm = tl.multiple_of(stride_qm, 8)
+        stride_kn = tl.multiple_of(stride_kn, 8)
+        stride_vn = tl.multiple_of(stride_vn, 8)
+        stride_dom = tl.multiple_of(stride_dom, 8)
+        stride_dqm = tl.multiple_of(stride_dqm, 8)
+        stride_dkn = tl.multiple_of(stride_dkn, 8)
+        stride_dvn = tl.multiple_of(stride_dvn, 8)
+
+    # Hint divisibility of the sequence axis itself (helps loop codegen and
+    # boundary masking on the last block).
+    if SEQLEN_Q_DIV_16:
+        seqlen_q = tl.multiple_of(seqlen_q, 16)
+    elif SEQLEN_Q_DIV_8:
+        seqlen_q = tl.multiple_of(seqlen_q, 8)
+    if SEQLEN_K_DIV_16:
+        seqlen_k = tl.multiple_of(seqlen_k, 16)
+    elif SEQLEN_K_DIV_8:
+        seqlen_k = tl.multiple_of(seqlen_k, 8)
+
     off_hb = tl.program_id(1)
     off_b = off_hb // nheads
     off_h = off_hb % nheads
