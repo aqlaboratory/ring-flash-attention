@@ -310,11 +310,137 @@ class TestFA3AdapterParams(unittest.TestCase):
                 window_size=(-1, -1), softcap=0.0, dropout_p=0.0, alibi_slopes="SLOPES",
             )
 
+    def _assert_extras_are_declared_defaults(self, params, explicit, sig):
+        """Every arg we pass but do not set must equal its own declared default.
+
+        get_default_args makes the adapter pass all ~34 forward args explicitly, of
+        which we set only a handful. That is a semantic no-op *only* if the rest carry
+        the function's own defaults -- the same property that settled the equivalent
+        question for FA2. _get_default_args force-sets `softcap` and pads non-defaulted
+        params with None, so this is worth asserting rather than assuming.
+        """
+        for name, value in params.items():
+            if name in explicit:
+                continue
+            declared = sig.parameters[name].default
+            if declared is inspect.Parameter.empty:
+                # Required params get None-padded by _get_default_args; we must be
+                # setting all of those explicitly, or the call is malformed.
+                self.fail(f"{name} is required but not set explicitly (got {value!r})")
+            self.assertEqual(
+                value, declared, f"{name} passed as {value!r}, declared default {declared!r}"
+            )
+
+    def test_forward_extras_equal_declared_defaults(self):
+        params = self.seam._fa3_forward_params(
+            q="Q", k="K", v="V",
+            softmax_scale=0.125, causal=True, window_size=(-1, -1),
+            softcap=0.0, dropout_p=0.0, alibi_slopes=None,
+        )
+        explicit = {
+            "q", "k", "v", "softmax_scale", "causal", "softcap",
+            "window_size_left", "window_size_right",
+        }
+        self._assert_extras_are_declared_defaults(params, explicit, self.fwd_sig)
+
+    def test_backward_extras_equal_declared_defaults(self):
+        params = self.seam._fa3_backward_params(
+            dout="DO", q="Q", k="K", v="V", out="O", softmax_lse="LSE",
+            dq="DQ", dk="DK", dv="DV",
+            softmax_scale=0.125, causal=True, window_size=(-1, -1),
+            softcap=0.0, deterministic=False, dropout_p=0.0, alibi_slopes=None,
+        )
+        explicit = {
+            "dout", "q", "k", "v", "out", "softmax_lse", "dq", "dk", "dv",
+            "softmax_scale", "is_causal", "softcap", "deterministic",
+            "window_size_left", "window_size_right",
+        }
+        self._assert_extras_are_declared_defaults(params, explicit, self.bwd_sig)
+
     def test_out_of_scope_variant_refused_under_fa3(self):
         self.seam.check_variant_supported("llama3_flash_attn_varlen")  # in scope
         self.seam.check_variant_supported("ring_flash_attn_backward")  # in scope
         with self.assertRaises(NotImplementedError):
             self.seam.check_variant_supported("zigzag_ring_flash_attn")
+
+
+class TestFA3BuildFlagGuard(unittest.TestCase):
+    """The guard must fire on a build that compiled out something ring attention needs.
+
+    Regression test for a real bug: the guard originally used the env-var spelling
+    FLASH_ATTENTION_DISABLE_* while the generated config keys are FLASHATTENTION_DISABLE_*
+    (no underscore after FLASH), so every lookup missed and the check was silently dead.
+    """
+
+    def _load_seam_with_config(self, build_flags):
+        import importlib
+        import importlib.machinery
+
+        iface = _load_fa3_interface()
+
+        pkg = types.ModuleType("flash_attn_3")
+        pkg.__path__ = []
+        pkg.__spec__ = importlib.machinery.ModuleSpec(
+            "flash_attn_3", loader=None, is_package=True
+        )
+        ext = types.ModuleType("flash_attn_3._C")
+        ext.__spec__ = importlib.machinery.ModuleSpec("flash_attn_3._C", loader=None)
+        cfg = types.ModuleType("flash_attn_3.flash_attn_config")
+        cfg.CONFIG = {"build_flags": build_flags}
+
+        names = (
+            "flash_attn_3",
+            "flash_attn_3._C",
+            "flash_attn_3.flash_attn_interface",
+            "flash_attn_3.flash_attn_config",
+            "ring_flash_attn.flash_attn_backend",
+        )
+        saved = {k: sys.modules.get(k) for k in names}
+        saved_env = os.environ.get("RING_FLASH_ATTN_BACKEND")
+        sys.modules["flash_attn_3"] = pkg
+        sys.modules["flash_attn_3._C"] = ext
+        sys.modules["flash_attn_3.flash_attn_interface"] = iface
+        sys.modules["flash_attn_3.flash_attn_config"] = cfg
+        os.environ["RING_FLASH_ATTN_BACKEND"] = "fa3"
+        sys.modules.pop("ring_flash_attn.flash_attn_backend", None)
+        try:
+            return importlib.import_module("ring_flash_attn.flash_attn_backend")
+        finally:
+            if saved_env is None:
+                os.environ.pop("RING_FLASH_ATTN_BACKEND", None)
+            else:
+                os.environ["RING_FLASH_ATTN_BACKEND"] = saved_env
+            for k, v in saved.items():
+                if v is None:
+                    sys.modules.pop(k, None)
+                else:
+                    sys.modules[k] = v
+
+    def test_guard_fires_on_disabled_varlen(self):
+        with self.assertRaises(ImportError) as cm:
+            self._load_seam_with_config({"FLASHATTENTION_DISABLE_VARLEN": True})
+        self.assertIn("FLASHATTENTION_DISABLE_VARLEN", str(cm.exception))
+
+    def test_guard_fires_on_disabled_backward(self):
+        with self.assertRaises(ImportError) as cm:
+            self._load_seam_with_config({"FLASHATTENTION_DISABLE_BACKWARD": True})
+        self.assertIn("training", str(cm.exception))
+
+    def test_guard_silent_on_a_healthy_build(self):
+        seam = self._load_seam_with_config(
+            {
+                "FLASHATTENTION_DISABLE_VARLEN": False,
+                "FLASHATTENTION_DISABLE_LOCAL": False,
+                "FLASHATTENTION_DISABLE_BACKWARD": False,
+            }
+        )
+        self.assertEqual(seam.BACKEND, "fa3")
+
+    def test_guard_tolerates_unexpected_config_shape(self):
+        """An unrecognised layout means 'no opinion', never a failed import."""
+        for weird in ([], "TRUE", None, {"SOMETHING_ELSE": True}):
+            seam = self._load_seam_with_config(weird)
+            self.assertEqual(seam.BACKEND, "fa3")
 
 
 if __name__ == "__main__":

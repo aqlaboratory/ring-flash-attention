@@ -6,12 +6,20 @@ each in a dense and a varlen flavour. This module normalises those four onto the
 FA2 keyword set so the variant modules contain no version- or backend-specific
 branching.
 
-Two backends are available:
+Three backends are available:
 
 ``fa2``
     ``flash_attn.flash_attn_interface`` (FlashAttention 2.x). The default. Routes
     through ``torch.ops.flash_attn.*`` where the installed versions register it, so
     the dense path stays traceable under ``torch.compile``.
+
+``fa3``
+    ``flash_attn_3`` (FlashAttention 3). Opt in with ``RING_FLASH_ATTN_BACKEND=fa3``.
+    Keeps FA2's LSE layout, in-place ``dq``/``dk``/``dv`` contract, and ``-1`` window
+    sentinel, and registers real ``torch.library`` custom ops, so it traces under
+    ``torch.compile``. No dropout and no ALiBi. Dense and varlen share one op per
+    direction. Its backward renames ``causal`` to ``is_causal`` and orders
+    ``cu_seqlens_*`` before ``dq``/``dk``/``dv``, so calls here are keyword-only.
 
 ``fa4``
     ``flash_attn.cute.interface`` (FlashAttention 4, distributed as ``flash-attn-4``).
@@ -57,6 +65,11 @@ _FA3_INSTALL_HINT = (
 
 # FA3's interface module has moved between releases. Tried in this order; the one that
 # resolves is recorded in FA3_MODULE so errors can name it.
+#
+# `hopper.flash_attn_interface` is only reachable if someone puts a source checkout on
+# the path *and* has a built flash_attn_3._C from elsewhere -- the vendored hopper/ trees
+# that appear in site-packages have no extension, so is_fa3_available() rejects them
+# before this list is consulted. Kept as a last resort rather than a supported layout.
 _FA3_MODULE_CANDIDATES = (
     "flash_attn_3.flash_attn_interface",
     "flash_attn_interface",
@@ -491,24 +504,49 @@ elif BACKEND == "fa3":
     _flash_attn_forward = _fa3._flash_attn_forward
     _flash_attn_backward = _fa3._flash_attn_backward
 
-    # FA3 can compile out features ring attention depends on. These surface only as
-    # TORCH_CHECK failures deep in C++, so surface them here instead.
+    # FA3 can compile out features ring attention depends on; those surface only as
+    # TORCH_CHECK failures deep in C++, so report them here instead.
+    #
+    # The config module is generated at build time (hopper/setup.py:89) and sits beside
+    # the interface, so look for it next to whichever module resolved above before
+    # falling back to the top-level name that setup.py's py_modules installs.
+    #
+    # Note the keys are FLASHATTENTION_DISABLE_* -- no underscore after FLASH -- while
+    # the env vars that set them are FLASH_ATTENTION_DISABLE_*. Using the env-var
+    # spelling here silently disables this whole check.
+    _fa3_disable_flags = {
+        "FLASHATTENTION_DISABLE_VARLEN": "the varlen ring paths",
+        "FLASHATTENTION_DISABLE_LOCAL": "sliding-window attention",
+        "FLASHATTENTION_DISABLE_BACKWARD": "training (backward)",
+    }
+    _fa3_config_candidates = []
+    if "." in FA3_MODULE:
+        _fa3_config_candidates.append(FA3_MODULE.rsplit(".", 1)[0] + ".flash_attn_config")
+    _fa3_config_candidates.append("flash_attn_config")
+
     try:
-        from flash_attn_config import CONFIG as _FA3_CONFIG
+        _flags = None
+        for _cand in _fa3_config_candidates:
+            try:
+                _flags = importlib.import_module(_cand).CONFIG["build_flags"]
+                break
+            except Exception:
+                continue
+        # Values are real booleans (hopper/setup.py:51 computes them as `== "TRUE"`),
+        # so plain truthiness is correct here.
+        if isinstance(_flags, dict):
+            for _flag, _why in _fa3_disable_flags.items():
+                if _flags.get(_flag):
+                    raise ImportError(
+                        f"this flash-attn-3 build was compiled with {_flag}=TRUE, which "
+                        f"disables {_why}. Rebuild without it, or use {_ENV_VAR}=fa2."
+                    )
+    except ImportError:
+        raise
     except Exception:
-        _FA3_CONFIG = None
-    if _FA3_CONFIG is not None:
-        _flags = _FA3_CONFIG.get("build_flags", {}) or {}
-        for _flag, _why in (
-            ("FLASH_ATTENTION_DISABLE_VARLEN", "the varlen ring paths"),
-            ("FLASH_ATTENTION_DISABLE_LOCAL", "sliding-window attention"),
-            ("FLASH_ATTENTION_DISABLE_BACKWARD", "training (backward)"),
-        ):
-            if _flags.get(_flag):
-                raise ImportError(
-                    f"this flash-attn-3 build was compiled with {_flag}=TRUE, which "
-                    f"disables {_why}. Rebuild without it, or use {_ENV_VAR}=fa2."
-                )
+        # The config module is optional and its shape is a build-time detail; an
+        # unrecognised layout means "no opinion", never a failed import.
+        pass
 
     CAPABILITIES = Capabilities(
         name="fa3",
@@ -611,6 +649,10 @@ elif BACKEND == "fa3":
         outputs = _flash_attn_forward(**params)
         # (out, softmax_lse, out_accum, softmax_lse_accum); the accum pair is empty
         # unless num_splits > 1, which we never set.
+        #
+        # `out_` is deliberately left None: FA3's fake impl raises on a preallocated
+        # output under tracing, so writing straight into a ring buffer here would cost
+        # torch.compile support.
         return outputs[0], outputs[1]
 
     def fa_backward(
@@ -956,7 +998,7 @@ elif BACKEND == "fa4":
 
 
 # ---------------------------------------------------------------------------
-# Backend-agnostic guards (shared by both adapters, driven by CAPABILITIES)
+# Backend-agnostic guards (shared by all adapters, driven by CAPABILITIES)
 # ---------------------------------------------------------------------------
 
 

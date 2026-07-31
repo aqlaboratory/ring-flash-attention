@@ -18,12 +18,16 @@ tests=(
 )
 
 cpu_tests=(
-  test.test_reduce_scatter_handle_manager
-  test.test_llama_bwd_stride_flags
+  test_reduce_scatter_handle_manager
+  test_llama_bwd_stride_flags
+  test_fa3_arg_binding
 )
 
+# Run as bare module names with test/ on the path. The previous `test.<name>` form
+# resolved to the CPython stdlib `test` package (there is no test/__init__.py here),
+# so these never actually ran.
 for test in "${cpu_tests[@]}"; do
-  python -m unittest "$test"
+  PYTHONPATH=.:test python -m unittest "$test"
 done
 
 for test in "${tests[@]}"; do
