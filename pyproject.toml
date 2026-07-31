@@ -18,10 +18,12 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-# Selection stays a runtime decision via RING_FLASH_ATTN_BACKEND; this extra only
-# documents the package that provides the `flash_attn.cute` backend. flash-attn-4 is
-# not on PyPI as of this writing -- install it from a flash-attention checkout with
-# `pip install -e <checkout>/flash_attn/cute`.
+# Selection stays a runtime decision via RING_FLASH_ATTN_BACKEND; these extras only
+# document which distribution provides each backend. Neither is on PyPI as of this
+# writing -- both are built from a flash-attention checkout:
+#   fa3: `pip install -e <checkout>/hopper`            (needs CUDA_HOME; sm90a by default)
+#   fa4: `pip install -e <checkout>/flash_attn/cute`
+fa3 = ["flash-attn-3"]
 fa4 = ["flash-attn-4"]
 
 [project.urls]

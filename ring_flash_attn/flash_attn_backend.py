@@ -41,13 +41,26 @@ __all__ = [
     "fa_forward",
     "fa_varlen_backward",
     "fa_varlen_forward",
+    "is_fa3_available",
     "is_fa4_available",
 ]
 
 _ENV_VAR = "RING_FLASH_ATTN_BACKEND"
-_VALID_BACKENDS = ("fa2", "fa4")
+_VALID_BACKENDS = ("fa2", "fa3", "fa4")
 _FA4_INSTALL_HINT = (
     "install it with `pip install -e <flash-attention-checkout>/flash_attn/cute`"
+)
+_FA3_INSTALL_HINT = (
+    "build it with `pip install -e <flash-attention-checkout>/hopper` (needs CUDA_HOME "
+    "and compiles for sm90a by default)"
+)
+
+# FA3's interface module has moved between releases. Tried in this order; the one that
+# resolves is recorded in FA3_MODULE so errors can name it.
+_FA3_MODULE_CANDIDATES = (
+    "flash_attn_3.flash_attn_interface",
+    "flash_attn_interface",
+    "hopper.flash_attn_interface",
 )
 
 
@@ -112,6 +125,27 @@ def is_fa4_available() -> bool:
     )
 
 
+def is_fa3_available() -> bool:
+    """Return whether flash-attn-3 looks importable, without importing its interface.
+
+    Probes the compiled extension ``flash_attn_3._C`` rather than the interface module,
+    because the interface alone is not enough: several environments here carry a raw
+    ``hopper/`` directory copied into site-packages with no extension built, so an
+    interface-only probe reports available and then dies at the first kernel call.
+
+    ``find_spec("flash_attn_3._C")`` is safe in a way the FA4 equivalent was not --
+    ``flash_attn_3/__init__.py`` does not import the interface, so resolving this
+    submodule does not pull in the kernels. We deliberately do *not* probe
+    ``flash_attn_3.flash_attn_interface``, which would execute that module's
+    ``import flash_attn_3._C`` at module scope.
+    """
+    try:
+        return importlib.util.find_spec("flash_attn_3._C") is not None
+    except Exception:
+        # A broken or partially-installed parent package can make even locating it fail.
+        return False
+
+
 def available_backends() -> Tuple[str, ...]:
     """Backends usable in this environment, for tests to skip on.
 
@@ -130,6 +164,8 @@ def available_backends() -> Tuple[str, ...]:
         found.append("fa2")
     except Exception:
         pass
+    if is_fa3_available():
+        found.append("fa3")
     if is_fa4_available():
         found.append("fa4")
     return tuple(found)
@@ -177,6 +213,23 @@ def _select_backend() -> str:
 BACKEND = _select_backend()
 
 
+def _set_window(params: dict, window_size) -> None:
+    """Apply the window in whichever arity the resolved signature uses.
+
+    Both FA2 and FA3 have shipped releases taking either a ``window_size`` tuple or the
+    two ints ``window_size_left``/``window_size_right``. ``params`` comes from signature
+    introspection, so the key-presence check is meaningful rather than a guess.
+
+    Shared by the fa2 and fa3 adapters. Not used by fa4, whose schema needs ``None``
+    rather than the ``-1`` sentinel -- see ``_split_window`` in that branch.
+    """
+    if "window_size" in params:
+        params["window_size"] = window_size
+    else:
+        params["window_size_left"] = window_size[0]
+        params["window_size_right"] = window_size[1]
+
+
 # ---------------------------------------------------------------------------
 # fa2
 # ---------------------------------------------------------------------------
@@ -194,16 +247,27 @@ if BACKEND == "fa2":
         # Catch broadly: a flash_attn built against a different torch fails at
         # extension-load time as ImportError (undefined symbol), OSError, or
         # RuntimeError depending on the mismatch -- not ModuleNotFoundError.
-        if is_fa4_available():
-            extra = (
-                "flash-attn-4 is installed, though -- set "
-                f"{_ENV_VAR}=fa4 to use it instead. Note that flash-attn-4 installs "
-                "into the same `flash_attn` package namespace, so if the failure above "
-                "came from `flash_attn/__init__.py` itself, the broken flash-attn 2.x "
-                "must be repaired or uninstalled before either backend can load."
+        _alternates = []
+        if is_fa3_available():
+            _alternates.append(
+                f"flash-attn-3 is installed -- set {_ENV_VAR}=fa3 to use it. It is a "
+                "separate `flash_attn_3` package, so it is unaffected by whatever is "
+                "wrong with flash-attn 2.x here."
             )
+        if is_fa4_available():
+            _alternates.append(
+                f"flash-attn-4 is installed -- set {_ENV_VAR}=fa4 to use it. Note it "
+                "installs into the same `flash_attn` package namespace, so if the "
+                "failure above came from `flash_attn/__init__.py` itself, the broken "
+                "flash-attn 2.x must be repaired or uninstalled first."
+            )
+        if _alternates:
+            extra = " ".join(_alternates)
         else:
-            extra = f"flash-attn-4 was not found either; {_FA4_INSTALL_HINT}."
+            extra = (
+                f"No other backend was found either -- for flash-attn-3 {_FA3_INSTALL_HINT}, "
+                f"or for flash-attn-4 {_FA4_INSTALL_HINT}."
+            )
         raise ImportError(
             f"ring_flash_attn could not load the flash_attn (FA2) backend: {e}. {extra}"
         ) from e
@@ -230,18 +294,6 @@ if BACKEND == "fa2":
         supports_window=True,
         supports_backward=True,
     )
-
-    def _set_window(params: dict, window_size) -> None:
-        """Apply the window in whichever arity the installed FA2 signature uses.
-
-        FA < 2.7 takes a ``window_size`` tuple; FA >= 2.7 takes two ints. ``params``
-        comes from signature introspection, so the key presence check is meaningful.
-        """
-        if "window_size" in params:
-            params["window_size"] = window_size
-        else:
-            params["window_size_left"] = window_size[0]
-            params["window_size_right"] = window_size[1]
 
     def _unpack_forward(outputs):
         """FA <= 2.6 returns 8 values, FA >= 2.7 returns 4. We want out and lse."""
@@ -407,6 +459,278 @@ if BACKEND == "fa2":
         )
         _set_window(params, window_size)
         _flash_attn_varlen_backward(**params)
+
+
+# ---------------------------------------------------------------------------
+# fa3
+# ---------------------------------------------------------------------------
+
+elif BACKEND == "fa3":
+    if not is_fa3_available():
+        raise ImportError(
+            f"{_ENV_VAR}=fa3 was requested but the flash_attn_3._C extension was not "
+            f"found. A bare `hopper/` source directory is not enough -- the CUDA "
+            f"extension must be built; {_FA3_INSTALL_HINT}."
+        )
+
+    FA3_MODULE = None
+    _fa3_errors = []
+    for _candidate in _FA3_MODULE_CANDIDATES:
+        try:
+            _fa3 = importlib.import_module(_candidate)
+            FA3_MODULE = _candidate
+            break
+        except Exception as e:  # noqa: PERF203 - we want the reason for each candidate
+            _fa3_errors.append(f"{_candidate}: {type(e).__name__}: {e}")
+    if FA3_MODULE is None:
+        raise ImportError(
+            "ring_flash_attn found flash_attn_3._C but could not import the flash-attn-3 "
+            "interface module. Tried:\n  " + "\n  ".join(_fa3_errors) + f"\n{_FA3_INSTALL_HINT}."
+        )
+
+    _flash_attn_forward = _fa3._flash_attn_forward
+    _flash_attn_backward = _fa3._flash_attn_backward
+
+    # FA3 can compile out features ring attention depends on. These surface only as
+    # TORCH_CHECK failures deep in C++, so surface them here instead.
+    try:
+        from flash_attn_config import CONFIG as _FA3_CONFIG
+    except Exception:
+        _FA3_CONFIG = None
+    if _FA3_CONFIG is not None:
+        _flags = _FA3_CONFIG.get("build_flags", {}) or {}
+        for _flag, _why in (
+            ("FLASH_ATTENTION_DISABLE_VARLEN", "the varlen ring paths"),
+            ("FLASH_ATTENTION_DISABLE_LOCAL", "sliding-window attention"),
+            ("FLASH_ATTENTION_DISABLE_BACKWARD", "training (backward)"),
+        ):
+            if _flags.get(_flag):
+                raise ImportError(
+                    f"this flash-attn-3 build was compiled with {_flag}=TRUE, which "
+                    f"disables {_why}. Rebuild without it, or use {_ENV_VAR}=fa2."
+                )
+
+    CAPABILITIES = Capabilities(
+        name="fa3",
+        supports_dropout=False,
+        supports_alibi=False,
+        supports_softcap=True,
+        supports_window=True,
+        supports_backward=True,
+    )
+
+    # FA3 unifies dense and varlen into ONE op per direction -- there is no
+    # _flash_attn_varlen_forward to import. The varlen wrappers below call the same two
+    # ops, just supplying cu_seqlens_*/max_seqlen_*.
+    #
+    # Two shapes of drift are absorbed by introspecting the real signature: releases
+    # differ on window arity (`window_size` tuple vs `window_size_left`/`_right` ints)
+    # and on the backward causal kwarg (`causal` vs `is_causal`). get_default_args
+    # handles the CustomOpDef via its `_init_fn` fallback and is cached per function,
+    # so this costs nothing per ring step.
+    _FA3_BWD_CAUSAL_KEY = (
+        "is_causal" if "is_causal" in get_default_args(_flash_attn_backward) else "causal"
+    )
+
+    def _fa3_forward_params(
+        q, k, v, softmax_scale, causal, window_size, softcap, dropout_p, alibi_slopes
+    ):
+        _check_unsupported(dropout_p, alibi_slopes)
+        params = get_default_args(_flash_attn_forward).copy()
+        params.update(
+            {
+                "q": q,
+                "k": k,
+                "v": v,
+                "softmax_scale": softmax_scale,
+                "causal": causal,
+                "softcap": softcap,
+            }
+        )
+        _set_window(params, window_size)
+        return params
+
+    def _fa3_backward_params(
+        dout,
+        q,
+        k,
+        v,
+        out,
+        softmax_lse,
+        dq,
+        dk,
+        dv,
+        softmax_scale,
+        causal,
+        window_size,
+        softcap,
+        deterministic,
+        dropout_p,
+        alibi_slopes,
+    ):
+        _check_unsupported(dropout_p, alibi_slopes)
+        params = get_default_args(_flash_attn_backward).copy()
+        params.update(
+            {
+                "dout": dout,
+                "q": q,
+                "k": k,
+                "v": v,
+                "out": out,
+                "softmax_lse": softmax_lse,
+                # Must always be supplied: they are Optional, and the C++ silently
+                # allocates throwaway buffers when omitted, computing the gradient and
+                # discarding it with no error.
+                "dq": dq,
+                "dk": dk,
+                "dv": dv,
+                "softmax_scale": softmax_scale,
+                _FA3_BWD_CAUSAL_KEY: causal,
+                "softcap": softcap,
+                "deterministic": deterministic,
+            }
+        )
+        _set_window(params, window_size)
+        return params
+
+    def fa_forward(
+        q,
+        k,
+        v,
+        dropout_p=0.0,
+        softmax_scale=None,
+        causal=False,
+        window_size=(-1, -1),
+        softcap=0.0,
+        alibi_slopes=None,
+        use_custom_op=True,  # accepted and ignored: the FA3 symbols *are* the custom ops
+    ):
+        params = _fa3_forward_params(
+            q, k, v, softmax_scale, causal, window_size, softcap, dropout_p, alibi_slopes
+        )
+        outputs = _flash_attn_forward(**params)
+        # (out, softmax_lse, out_accum, softmax_lse_accum); the accum pair is empty
+        # unless num_splits > 1, which we never set.
+        return outputs[0], outputs[1]
+
+    def fa_backward(
+        dout,
+        q,
+        k,
+        v,
+        out,
+        softmax_lse,
+        dq,
+        dk,
+        dv,
+        dropout_p=0.0,
+        softmax_scale=None,
+        causal=False,
+        window_size=(-1, -1),
+        softcap=0.0,
+        alibi_slopes=None,
+        deterministic=False,
+        use_custom_op=True,  # accepted and ignored: the FA3 symbols *are* the custom ops
+    ):
+        params = _fa3_backward_params(
+            dout,
+            q,
+            k,
+            v,
+            out,
+            softmax_lse,
+            dq,
+            dk,
+            dv,
+            softmax_scale,
+            causal,
+            window_size,
+            softcap,
+            deterministic,
+            dropout_p,
+            alibi_slopes,
+        )
+        # Writes into dq/dk/dv in place (mutates_args); returns softmax_d, unused here.
+        _flash_attn_backward(**params)
+
+    def fa_varlen_forward(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        dropout_p=0.0,
+        softmax_scale=None,
+        causal=False,
+        window_size=(-1, -1),
+        softcap=0.0,
+        alibi_slopes=None,
+    ):
+        params = _fa3_forward_params(
+            q, k, v, softmax_scale, causal, window_size, softcap, dropout_p, alibi_slopes
+        )
+        params.update(
+            {
+                "cu_seqlens_q": cu_seqlens_q,
+                "cu_seqlens_k": cu_seqlens_k,
+                "max_seqlen_q": max_seqlen_q,
+                "max_seqlen_k": max_seqlen_k,
+            }
+        )
+        outputs = _flash_attn_forward(**params)
+        return outputs[0], outputs[1]
+
+    def fa_varlen_backward(
+        dout,
+        q,
+        k,
+        v,
+        out,
+        softmax_lse,
+        dq,
+        dk,
+        dv,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        dropout_p=0.0,
+        softmax_scale=None,
+        causal=False,
+        window_size=(-1, -1),
+        softcap=0.0,
+        alibi_slopes=None,
+        deterministic=False,
+    ):
+        params = _fa3_backward_params(
+            dout,
+            q,
+            k,
+            v,
+            out,
+            softmax_lse,
+            dq,
+            dk,
+            dv,
+            softmax_scale,
+            causal,
+            window_size,
+            softcap,
+            deterministic,
+            dropout_p,
+            alibi_slopes,
+        )
+        params.update(
+            {
+                "cu_seqlens_q": cu_seqlens_q,
+                "cu_seqlens_k": cu_seqlens_k,
+                "max_seqlen_q": max_seqlen_q,
+                "max_seqlen_k": max_seqlen_k,
+            }
+        )
+        _flash_attn_backward(**params)
 
 
 # ---------------------------------------------------------------------------
@@ -654,28 +978,45 @@ def _check_unsupported(dropout_p, alibi_slopes) -> None:
         )
 
 
-# Ring variants whose numerics have actually been validated against FA4. Everything
-# else is routed through this seam but never checked against the cute kernels, so it
-# is refused rather than silently run. See the plan's scope section.
-_FA4_VALIDATED_VARIANTS = frozenset(
-    {
-        "llama3_flash_attn_varlen",
-        "llama_fwd_ring_bwd_flash_attn",
-        "ring_flash_attn_backward",
-    }
-)
+# Ring variants that are in scope for each non-default backend. Everything else is
+# routed through this seam but was never exercised against those kernels, so it is
+# refused rather than silently run with unverified numerics.
+#
+# This marks *scope*, not proven correctness -- adding a name asserts only that the
+# variant is intended to work there. fa2 is absent because it is the reference backend
+# and every variant is in scope.
+_VALIDATED_VARIANTS = {
+    "fa3": frozenset(
+        {
+            "llama3_flash_attn_varlen",
+            "llama_fwd_ring_bwd_flash_attn",
+            "ring_flash_attn_backward",
+        }
+    ),
+    "fa4": frozenset(
+        {
+            "llama3_flash_attn_varlen",
+            "llama_fwd_ring_bwd_flash_attn",
+            "ring_flash_attn_backward",
+        }
+    ),
+}
+
+_BACKEND_DISPLAY_NAME = {"fa2": "flash-attn 2.x", "fa3": "flash-attn-3", "fa4": "flash-attn-4"}
 
 
 def check_variant_supported(variant: str) -> None:
-    """Refuse ring variants that have not been validated against the active backend.
+    """Refuse ring variants that are out of scope for the active backend.
 
-    Called by the variant modules that were deliberately left out of FA4 scope. Under
-    fa2 (the default) this never fires.
+    Called by the variant modules deliberately left out of the fa3/fa4 scope. Under
+    fa2 (the default) this never fires, since fa2 has no entry in _VALIDATED_VARIANTS.
     """
-    if BACKEND == "fa4" and variant not in _FA4_VALIDATED_VARIANTS:
+    in_scope = _VALIDATED_VARIANTS.get(BACKEND)
+    if in_scope is not None and variant not in in_scope:
         raise NotImplementedError(
-            f"'{variant}' has not been validated against the flash-attn-4 backend, so "
-            f"it is refused rather than run with unverified numerics. Validated under "
-            f"fa4: {', '.join(sorted(_FA4_VALIDATED_VARIANTS))}. "
+            f"'{variant}' is not in scope for the "
+            f"{_BACKEND_DISPLAY_NAME.get(BACKEND, BACKEND)} backend, so it is refused "
+            f"rather than run with unverified numerics. In scope under {BACKEND}: "
+            f"{', '.join(sorted(in_scope))}. "
             f"Unset {_ENV_VAR} (or set it to fa2) to use this variant."
         )
