@@ -1,11 +1,8 @@
 import torch
 import torch.distributed as dist
-from flash_attn.flash_attn_interface import (
-    _flash_attn_varlen_forward,
-    _flash_attn_varlen_backward,
-)
+from .flash_attn_backend import fa_varlen_forward, fa_varlen_backward
 import logging
-from .utils import get_default_args, AllGatherComm as Comm
+from .utils import AllGatherComm as Comm
 
 
 def llama3_flash_attn_prepare_cu_seqlens(
@@ -121,37 +118,21 @@ def llama3_flash_attn_varlen_forward(
         v_i = kv_buffer[1][local_k_slice]
         # logging.debug(f"fwd i {i} k_ishape {k_i.shape} q.shape {q.shape} kv_buffer[0] {kv_buffer[0].shape} local_k_slice {local_k_slice}")     
 
-        # params = get_default_args(_flash_attn_varlen_forward).copy()
-        params = {
-                "q": q_i,
-                "k": k_i,
-                "v": v_i,
-                "cu_seqlens_q": cu_seqlens_q,
-                "cu_seqlens_k": cu_seqlens_k,
-                "max_seqlen_q": max_seqlen_q,
-                "max_seqlen_k": max_seqlen_k,
-                "dropout_p": dropout_p,
-                "softmax_scale": softmax_scale,
-                "causal": causal,
-                "softcap": softcap,
-                "alibi_slopes": alibi_slopes,
-                "return_softmax": True and dropout_p > 0,
-        }
-        if "window_size" in params:
-            params.update({"window_size": window_size})
-        else:
-            params.update(
-                {
-                    "window_size_left": window_size[0],
-                    "window_size_right": window_size[1],
-                }
-            )
-        outputs = _flash_attn_varlen_forward(**params)
-        if len(outputs) == 8:
-            out, _, _, _, _, lse, _, _ = outputs
-        else:
-            assert len(outputs) == 4
-            out, lse, _, _ = outputs
+        out, lse = fa_varlen_forward(
+            q_i,
+            k_i,
+            v_i,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            softcap=softcap,
+            alibi_slopes=alibi_slopes,
+        )
         out_list.append(out)
         lse_list.append(lse)
 
@@ -251,38 +232,28 @@ def llama3_flash_attn_varlen_backward(
         dv_i = dkv_buffer[1][local_k_slice]
         # logging.debug(f"bwd i {i} q_slice {q_slice} k_ishape {k_i.shape} dv_i.shape {dv_i.shape} q.shape {q.shape}")  
 
-        # params = get_default_args(_flash_attn_varlen_backward).copy()
-        params = {
-                "dout": dout_i,
-                "q": q_i,
-                "k": k_i,
-                "v": v_i,
-                "out": out_i,
-                "softmax_lse": lse_i,
-                "dq": dq_i,
-                "dk": dk_i,
-                "dv": dv_i,
-                "cu_seqlens_q": cu_seqlens_q,
-                "cu_seqlens_k": cu_seqlens_k,
-                "max_seqlen_q": max_seqlen_q,
-                "max_seqlen_k": max_seqlen_k,
-                "dropout_p": dropout_p,
-                "softmax_scale": softmax_scale,
-                "causal": causal,
-                "softcap": softcap,
-                "alibi_slopes": alibi_slopes,
-                "deterministic": deterministic,
-            }
-        if "window_size" in params:
-            params.update({"window_size": window_size})
-        else:
-            params.update(
-                {
-                    "window_size_left": window_size[0],
-                    "window_size_right": window_size[1],
-                }
-            )
-        _flash_attn_varlen_backward(**params)
+        fa_varlen_backward(
+            dout_i,
+            q_i,
+            k_i,
+            v_i,
+            out_i,
+            lse_i,
+            dq_i,
+            dk_i,
+            dv_i,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            softcap=softcap,
+            alibi_slopes=alibi_slopes,
+            deterministic=deterministic,
+        )
 
         if heads_k_stride != nheads_k:
             # reduce_scatter needs contiguous buffer

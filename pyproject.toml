@@ -17,6 +17,13 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 
+[project.optional-dependencies]
+# Selection stays a runtime decision via RING_FLASH_ATTN_BACKEND; this extra only
+# documents the package that provides the `flash_attn.cute` backend. flash-attn-4 is
+# not on PyPI as of this writing -- install it from a flash-attention checkout with
+# `pip install -e <checkout>/flash_attn/cute`.
+fa4 = ["flash-attn-4"]
+
 [project.urls]
 Homepage = "https://github.com/zhuzilin/ring-flash-attention"
 Issues = "https://github.com/zhuzilin/ring-flash-attention/issues"
