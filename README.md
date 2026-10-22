@@ -118,6 +118,17 @@ cd ring-flash-attention
 pip install .
 ```
 
+### Flash-attention backend
+
+The kernels come from `flash-attn` (FA2), `flash-attn-3` (FA3) or `flash-attn-4` (FA4), chosen once at import by `RING_FLASH_ATTN_BACKEND`:
+
+| value | behaviour |
+| --- | --- |
+| `auto` (default; unset or empty) | try FA2, then FA4 (real imports, so a broken FA2 falls through). Never selects FA3. |
+| `fa2` / `fa3` / `fa4` | exactly that backend; no fallback |
+
+If nothing loads, `import ring_flash_attn` raises `ImportError` naming each failure. FA3 and FA4 have no dropout or ALiBi, FA4's backward needs sm90+, and only `llama3_flash_attn_varlen`, `llama_fwd_ring_bwd_flash_attn` and the ring backward are in scope for them: the other variants raise `NotImplementedError`. FA4 cannot be traced by `torch.compile`; its calls take a graph break.
+
 ### TODOs
 
 - [x] Implement `ring_flash_attn_varlen_qkvpacked_func`

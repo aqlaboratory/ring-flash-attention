@@ -18,7 +18,8 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-# Selection stays a runtime decision via RING_FLASH_ATTN_BACKEND; these extras only
+# Selection stays a runtime decision via RING_FLASH_ATTN_BACKEND (default `auto`: fa2, then
+# fa4, never fa3); these extras only
 # document which distribution provides each backend. Neither is on PyPI as of this
 # writing -- both are built from a flash-attention checkout:
 #   fa3: `pip install -e <checkout>/hopper`            (needs CUDA_HOME; sm90a by default)

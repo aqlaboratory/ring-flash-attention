@@ -6,10 +6,22 @@ each in a dense and a varlen flavour. This module normalises those four onto the
 FA2 keyword set so the variant modules contain no version- or backend-specific
 branching.
 
+Selection is driven by ``RING_FLASH_ATTN_BACKEND`` (unset or empty means ``auto``):
+
+``auto``
+    The default. Tries ``fa2``, then ``fa4``, using real imports rather than presence
+    checks. ``fa3`` is never auto-selected: it is a separate ``flash_attn_3`` package that
+    can coexist with the others, so it is opt-in only. If neither loads, ``ImportError``
+    is raised at import naming both failures (this repo requires a GPU, so there are no
+    stubs).
+
+``fa2`` / ``fa3`` / ``fa4``
+    Exactly that backend, with no fallback.
+
 Three backends are available:
 
 ``fa2``
-    ``flash_attn.flash_attn_interface`` (FlashAttention 2.x). The default. Routes
+    ``flash_attn.flash_attn_interface`` (FlashAttention 2.x). Preferred by ``auto``. Routes
     through ``torch.ops.flash_attn.*`` where the installed versions register it, so
     the dense path stays traceable under ``torch.compile``.
 
@@ -28,9 +40,11 @@ Three backends are available:
     ``torch.compile``. Its backward additionally requires compute capability 9.0+.
 """
 
+import functools
 import importlib
 import importlib.metadata
 import importlib.util
+import inspect
 import os
 from pathlib import Path
 from typing import Optional, Tuple
@@ -45,6 +59,7 @@ __all__ = [
     "Capabilities",
     "available_backends",
     "check_variant_supported",
+    "select_backend",
     "fa_backward",
     "fa_forward",
     "fa_varlen_backward",
@@ -54,7 +69,9 @@ __all__ = [
 ]
 
 _ENV_VAR = "RING_FLASH_ATTN_BACKEND"
-_VALID_BACKENDS = ("fa2", "fa3", "fa4")
+_VALID_BACKENDS = ("auto", "fa2", "fa3", "fa4")
+# FA3 is deliberately absent: it is opt-in only.
+_AUTO_ORDER = ("fa2", "fa4")
 _FA4_INSTALL_HINT = (
     "install it with `pip install -e <flash-attention-checkout>/flash_attn/cute`"
 )
@@ -213,17 +230,65 @@ class Capabilities:
         return f"Capabilities(name={self.name!r})"
 
 
-def _select_backend() -> str:
-    backend = os.environ.get(_ENV_VAR, "fa2").strip().lower()
-    if backend not in _VALID_BACKENDS:
+def _probe_fa2() -> None:
+    import flash_attn  # noqa: F401
+    from flash_attn.flash_attn_interface import (  # noqa: F401
+        _flash_attn_backward,
+        _flash_attn_forward,
+        _flash_attn_varlen_backward,
+        _flash_attn_varlen_forward,
+    )
+
+
+def _probe_fa4() -> None:
+    # The presence check is not redundant with the import: flash-attn 2.8.x bundles an
+    # unrelated `flash_attn/cute` whose private entry points have a different signature,
+    # and that import succeeds. See is_fa4_available().
+    if not is_fa4_available():
+        raise ImportError("flash-attn-4 (flash_attn.cute) is not installed")
+    from flash_attn.cute.interface import _flash_attn_bwd, _flash_attn_fwd  # noqa: F401
+
+
+_PROBES = {"fa2": _probe_fa2, "fa4": _probe_fa4}
+
+
+def select_backend(requested: str, probes=None) -> str:
+    """Resolve a requested backend name (possibly ``auto``) to ``fa2``/``fa3``/``fa4``.
+
+    An explicit name is returned as-is, and the backend's own section below then loads it
+    and raises a backend-specific error if it cannot. ``auto`` resolves with real imports
+    in ``_AUTO_ORDER``; any failure counts (``ImportError``, ``OSError`` for a
+    ``flash_attn_2_cuda`` .so that fails to load, ``RuntimeError`` for a torch ABI
+    mismatch). The result is never ``auto`` -- ``BACKEND`` keys ``_VALIDATED_VARIANTS``.
+    """
+    if requested not in _VALID_BACKENDS:
         raise ValueError(
-            f"{_ENV_VAR}={backend!r} is not a known backend. "
+            f"{_ENV_VAR}={requested!r} is not a known backend. "
             f"Expected one of {', '.join(_VALID_BACKENDS)}."
         )
-    return backend
+    if requested != "auto":
+        return requested
+    probes = _PROBES if probes is None else probes
+    failures = []
+    for name in _AUTO_ORDER:
+        try:
+            probes[name]()
+        except Exception as e:  # noqa: PERF203 - the reason for each backend is reported
+            failures.append(f"{name}: {type(e).__name__}: {e}")
+            continue
+        return name
+    raise ImportError(
+        f"ring_flash_attn could not load any flash-attn backend under "
+        f"{_ENV_VAR}=auto ({'; '.join(failures)}). flash-attn-3 is never auto-selected; "
+        f"set {_ENV_VAR}=fa3 to use it."
+    )
 
 
-BACKEND = _select_backend()
+def _requested_backend() -> str:
+    return os.environ.get(_ENV_VAR, "").strip().lower() or "auto"
+
+
+BACKEND = select_backend(_requested_backend())
 
 
 def _set_window(params: dict, window_size) -> None:
@@ -806,6 +871,22 @@ elif BACKEND == "fa4":
         supports_backward=True,  # gated per-device, see _check_backward_arch
     )
 
+    @functools.lru_cache(maxsize=None)
+    def _accepts(fn, name: str) -> bool:
+        params = inspect.signature(fn).parameters
+        return name in params or any(
+            p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+        )
+
+    def _max_seqlen_kwargs(fn, max_seqlen_q, max_seqlen_k) -> dict:
+        """Older FA4 builds infer the max seqlens from cu_seqlens and reject these kwargs.
+
+        Checked per function: ``_flash_attn_fwd`` and ``_flash_attn_bwd`` need not agree.
+        """
+        if not _accepts(fn, "max_seqlen_q"):
+            return {}
+        return dict(max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k)
+
     # Forward accepts sm_80 and up; backward is sm_90 and up.
     _MIN_BACKWARD_MAJOR = 9
 
@@ -832,6 +913,7 @@ elif BACKEND == "fa4":
             None if right is None or right < 0 else right,
         )
 
+    @torch.compiler.disable()
     def fa_forward(
         q,
         k,
@@ -861,6 +943,7 @@ elif BACKEND == "fa4":
         )
         return out, lse
 
+    @torch.compiler.disable()
     def fa_backward(
         dout,
         q,
@@ -902,6 +985,7 @@ elif BACKEND == "fa4":
         )
         _copy_back(dq, dk, dv, out_dq, out_dk, out_dv)
 
+    @torch.compiler.disable()
     def fa_varlen_forward(
         q,
         k,
@@ -925,17 +1009,17 @@ elif BACKEND == "fa4":
             v,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
             softmax_scale=softmax_scale,
             causal=causal,
             softcap=softcap,
             window_size_left=window_left,
             window_size_right=window_right,
             return_lse=True,
+            **_max_seqlen_kwargs(_flash_attn_fwd, max_seqlen_q, max_seqlen_k),
         )
         return out, lse
 
+    @torch.compiler.disable()
     def fa_varlen_backward(
         dout,
         q,
@@ -975,12 +1059,11 @@ elif BACKEND == "fa4":
             window_size_right=window_right,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
             deterministic=deterministic,
             dq=dq,
             dk=dk,
             dv=dv,
+            **_max_seqlen_kwargs(_flash_attn_bwd, max_seqlen_q, max_seqlen_k),
         )
         _copy_back(dq, dk, dv, out_dq, out_dk, out_dv)
 
@@ -1051,7 +1134,7 @@ def check_variant_supported(variant: str) -> None:
     """Refuse ring variants that are out of scope for the active backend.
 
     Called by the variant modules deliberately left out of the fa3/fa4 scope. Under
-    fa2 (the default) this never fires, since fa2 has no entry in _VALIDATED_VARIANTS.
+    fa2 this never fires, since fa2 has no entry in _VALIDATED_VARIANTS.
     """
     in_scope = _VALIDATED_VARIANTS.get(BACKEND)
     if in_scope is not None and variant not in in_scope:

@@ -21,6 +21,9 @@ cpu_tests=(
   test_reduce_scatter_handle_manager
   test_llama_bwd_stride_flags
   test_fa3_arg_binding
+  test_fa4_arg_binding
+  test_flash_attn_backend_selector
+  test_flash_attn_cold_import
 )
 
 # Run as bare module names with test/ on the path. The previous `test.<name>` form
