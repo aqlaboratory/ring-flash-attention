@@ -16,7 +16,7 @@ def main():
     device = torch.device(f"cuda:{rank}")
 
     nheads = 5
-    d = 8
+    d = 32
     dropout_p = 0
     causal = True
     deterministic = False
