@@ -80,6 +80,7 @@ class SelectBackendTest(unittest.TestCase):
         with self.assertRaises(NotImplementedError):
             self.seam.check_variant_supported("zigzag_ring_flash_attn")
         self.seam.check_variant_supported("llama3_flash_attn_varlen")
+        self.seam.check_variant_supported("ring_flash_attn_forward")
 
 
 class RequestedBackendTest(unittest.TestCase):

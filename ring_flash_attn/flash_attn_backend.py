@@ -1127,6 +1127,7 @@ _VALIDATED_VARIANTS = {
             "llama3_flash_attn_varlen",
             "llama_fwd_ring_bwd_flash_attn",
             "ring_flash_attn_backward",
+            "ring_flash_attn_forward",
         }
     ),
 }
