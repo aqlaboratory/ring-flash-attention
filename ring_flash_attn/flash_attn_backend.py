@@ -928,7 +928,8 @@ elif BACKEND == "fa4":
     ):
         _check_unsupported(dropout_p, alibi_slopes)
         window_left, window_right = _split_window(window_size)
-        out, lse = _flash_attn_fwd(
+        # Newer FA4 returns (out, lse, p, row_max, o_lo); only the first two matter here.
+        out, lse, *_ = _flash_attn_fwd(
             q,
             k,
             v,
@@ -966,7 +967,8 @@ elif BACKEND == "fa4":
         _check_unsupported(dropout_p, alibi_slopes)
         _check_backward_arch(q.device)
         window_left, window_right = _split_window(window_size)
-        out_dq, out_dk, out_dv = _flash_attn_bwd(
+        # Newer FA4 may append extras (e.g. dsink); we only pass what yields dq/dk/dv.
+        out_dq, out_dk, out_dv, *_ = _flash_attn_bwd(
             q,
             k,
             v,
@@ -1003,7 +1005,8 @@ elif BACKEND == "fa4":
     ):
         _check_unsupported(dropout_p, alibi_slopes)
         window_left, window_right = _split_window(window_size)
-        out, lse = _flash_attn_fwd(
+        # Newer FA4 returns (out, lse, p, row_max, o_lo); only the first two matter here.
+        out, lse, *_ = _flash_attn_fwd(
             q,
             k,
             v,
@@ -1045,7 +1048,8 @@ elif BACKEND == "fa4":
         _check_unsupported(dropout_p, alibi_slopes)
         _check_backward_arch(q.device)
         window_left, window_right = _split_window(window_size)
-        out_dq, out_dk, out_dv = _flash_attn_bwd(
+        # Newer FA4 may append extras (e.g. dsink); we only pass what yields dq/dk/dv.
+        out_dq, out_dk, out_dv, *_ = _flash_attn_bwd(
             q,
             k,
             v,
