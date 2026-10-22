@@ -59,3 +59,30 @@ def seam_reference_attn(q, k, v, dout, causal, softmax_scale=None):
         softmax_scale=softmax_scale, causal=causal,
     )
     return out, lse, dq, dk, dv
+
+
+def seam_reference_varlen_attn(q, k, v, dout, cu_seqlens, max_seqlen, causal, softmax_scale=None):
+    """Varlen counterpart of `seam_reference_attn`, for packed (total, nheads, d) inputs.
+
+    Self-attention only: cu_seqlens and max_seqlen are used for both q and k. Returns out,
+    lse and dq, dk, dv; lse keeps whatever layout the selected backend produces.
+    """
+    from ring_flash_attn.flash_attn_backend import (
+        fa_varlen_backward,
+        fa_varlen_forward,
+    )
+
+    q, k, v = (t.detach().contiguous() for t in (q, k, v))
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+    out, lse = fa_varlen_forward(
+        q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen,
+        softmax_scale=softmax_scale, causal=causal,
+    )
+    dq, dk, dv = (torch.empty_like(t) for t in (q, k, v))
+    fa_varlen_backward(
+        dout.contiguous(), q, k, v, out, lse, dq, dk, dv,
+        cu_seqlens, cu_seqlens, max_seqlen, max_seqlen,
+        softmax_scale=softmax_scale, causal=causal,
+    )
+    return out, lse, dq, dk, dv
