@@ -77,9 +77,9 @@ def main():
     ring_dqkv = local_qkv.grad
 
     log("local_dqkv", local_dqkv)
-    log("dq diff", local_dqkv[:, 0] - ring_dqkv[:, 0])
-    log("dk diff", local_dqkv[:, 1] - ring_dqkv[:, 1])
-    log("dv diff", local_dqkv[:, 2] - ring_dqkv[:, 2])
+    log("dq diff", local_dqkv[:, :, 0] - ring_dqkv[:, :, 0])
+    log("dk diff", local_dqkv[:, :, 1] - ring_dqkv[:, :, 1])
+    log("dv diff", local_dqkv[:, :, 2] - ring_dqkv[:, :, 2])
 
     dist.destroy_process_group()
 
