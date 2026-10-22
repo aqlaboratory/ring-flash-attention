@@ -36,3 +36,26 @@ def log(msg, a, rank0_only=False):
                 flush=True,
             )
         dist.barrier()
+
+
+def seam_reference_attn(q, k, v, dout, causal, softmax_scale=None):
+    """Plain (non-ring) attention fwd+bwd on the full sequence via the backend seam.
+
+    Uses whichever backend ring_flash_attn selected (RING_FLASH_ATTN_BACKEND), so the
+    reference runs on the same kernels as the ring path and the test works with
+    flash-attn-4 alone, where `from flash_attn import flash_attn_*_func` does not exist.
+    Inputs are (batch, seqlen, nheads, d); returns out, lse (batch, nheads, seqlen) and
+    dq, dk, dv.
+    """
+    from ring_flash_attn.flash_attn_backend import fa_backward, fa_forward
+
+    q, k, v = (t.detach().contiguous() for t in (q, k, v))
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+    out, lse = fa_forward(q, k, v, softmax_scale=softmax_scale, causal=causal)
+    dq, dk, dv = (torch.empty_like(t) for t in (q, k, v))
+    fa_backward(
+        dout.contiguous(), q, k, v, out, lse, dq, dk, dv,
+        softmax_scale=softmax_scale, causal=causal,
+    )
+    return out, lse, dq, dk, dv
