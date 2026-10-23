@@ -1,9 +1,8 @@
 import sys
 import torch
 import torch.distributed as dist
-from flash_attn import flash_attn_qkvpacked_func
 from ring_flash_attn import ring_flash_attn_qkvpacked_func
-from utils import log, set_seed
+from utils import log, seam_reference_attn, set_seed
 
 
 def main():
@@ -43,15 +42,8 @@ def main():
         print("# forward:")
         print("#" * 30)
 
-    out, lse, _ = flash_attn_qkvpacked_func(
-        qkv,
-        dropout_p=dropout_p,
-        causal=causal,
-        window_size=(-1, -1),
-        alibi_slopes=None,
-        deterministic=deterministic,
-        return_attn_probs=True,
-    )
+    q, k, v = qkv.unbind(dim=2)
+    out, lse, dq, dk, dv = seam_reference_attn(q, k, v, dout, causal)
 
     local_out = out.chunk(world_size, dim=1)[rank]
     local_lse = lse.chunk(world_size, dim=-1)[rank]
@@ -79,23 +71,20 @@ def main():
         print("# backward:")
         print("#" * 30)
 
-    out.backward(dout)
-    dqkv = qkv.grad
-    local_dqkv = dqkv.chunk(world_size, dim=1)[rank]
+    local_dqkv = torch.stack([dq, dk, dv], dim=2).chunk(world_size, dim=1)[rank]
 
     ring_out.backward(local_dout)
     ring_dqkv = local_qkv.grad
 
     log("local_dqkv", local_dqkv)
-    log("dq diff", local_dqkv[:, 0] - ring_dqkv[:, 0])
-    log("dk diff", local_dqkv[:, 1] - ring_dqkv[:, 1])
-    log("dv diff", local_dqkv[:, 2] - ring_dqkv[:, 2])
+    log("dq diff", local_dqkv[:, :, 0] - ring_dqkv[:, :, 0])
+    log("dk diff", local_dqkv[:, :, 1] - ring_dqkv[:, :, 1])
+    log("dv diff", local_dqkv[:, :, 2] - ring_dqkv[:, :, 2])
 
     dist.destroy_process_group()
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "compile":
         torch._dynamo.config.capture_scalar_outputs = True
-        flash_attn_qkvpacked_func = torch.compile(flash_attn_qkvpacked_func)
         ring_flash_attn_qkvpacked_func = torch.compile(ring_flash_attn_qkvpacked_func)
     main()

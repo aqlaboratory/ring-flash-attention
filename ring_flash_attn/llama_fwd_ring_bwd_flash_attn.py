@@ -1,28 +1,23 @@
 import torch
 import torch.distributed as dist
-from flash_attn.flash_attn_interface import _flash_attn_forward, _flash_attn_backward
+from .flash_attn_backend import fa_forward, fa_backward
 from .ring_flash_attn import ring_flash_attn_backward
 from einops import rearrange
 from typing import Optional, Tuple
 from .utils import (
-    get_default_args,
     AllGatherComm as Comm,
     ReduceScatterHandleManager,
 )
 import logging
 import torch.distributed._tensor as distp_tensor
-import flash_attn
 import os
 
-if torch.__version__ >= "2.4.0" and flash_attn.__version__ >= "2.7.0":
-    _wrapped_flash_attn_forward = torch.ops.flash_attn._flash_attn_forward
-else:
-    _wrapped_flash_attn_forward = _flash_attn_forward
-
-if torch.__version__ >= "2.4.0":
-    _wrapped_flash_attn_backward = torch.ops.flash_attn._flash_attn_backward
-else:
-    _wrapped_flash_attn_backward = _flash_attn_backward
+# Kept under their historical names: these are the seam the kernel-level backend
+# selection happens behind, and test_llama_bwd_stride_flags.py patches
+# `_wrapped_flash_attn_backward` on this module by name. Call sites below pass
+# keyword arguments only, which that test's stub relies on to identify dq/dk/dv.
+_wrapped_flash_attn_forward = fa_forward
+_wrapped_flash_attn_backward = fa_backward
 
 def llama_flash_attn_forward(
     process_group: dist.ProcessGroup,
@@ -207,7 +202,6 @@ def llama_flash_attn_forward(
             k_i = rearrange(current_kv_buffer[0].contiguous(), "w b s hs dh -> b (w s) hs dh")
             v_i = rearrange(current_kv_buffer[1].contiguous(), "w b s hs dh -> b (w s) hs dh")
 
-        # params = get_default_args(_flash_attn_varlen_forward).copy()
         params = {
             "q": q_i,
             "k": k_i,
@@ -215,23 +209,15 @@ def llama_flash_attn_forward(
             "dropout_p": dropout_p,
             "softmax_scale": softmax_scale,
             "causal": causal, # 'step' was not defined in this scope
-            "window_size_left": window_size[0],
-            "window_size_right": window_size[1],
+            "window_size": window_size,
             "softcap": softcap,
             "alibi_slopes": alibi_slopes,
-            "return_softmax": True and dropout_p > 0,
         }
-        # logging.debug(f"fwd i {i} k_ishape {k_i.shape} s{k_i[0,:3,0,:2]} e{k_i[0,-3:,0,:2]} q_i.shape {q_i.shape} params {params}")     
+        # logging.debug(f"fwd i {i} k_ishape {k_i.shape} s{k_i[0,:3,0,:2]} e{k_i[0,-3:,0,:2]} q_i.shape {q_i.shape} params {params}")
         # process_id = os.getpid()
         # if not os.path.exists('./logging/k_buffer_{}.pt'.format(process_id)):
         #     torch.save(k_i.detach(), './logging/k_buffer_{}.pt'.format(process_id))
-        # out, _, _, _, _, lse, _, _ = _flash_attn_varlen_forward(**params)
-        outputs = _wrapped_flash_attn_forward(**params)
-        if len(outputs) == 8:
-            out, _, _, _, _, lse, _, _ = outputs
-        else:
-            assert len(outputs) == 4
-            out, lse, _, _ = outputs
+        out, lse = _wrapped_flash_attn_forward(**params)
         out_list.append(out)
         lse_list.append(lse)
 
@@ -503,8 +489,7 @@ def llama_flash_attn_backward(
             "dropout_p": dropout_p,
             "softmax_scale": softmax_scale,
             "causal": causal,
-            "window_size_left": window_size[0],
-            "window_size_right": window_size[1],
+            "window_size": window_size,
             "softcap": softcap,
             "alibi_slopes": alibi_slopes,
             "deterministic": deterministic,
@@ -1057,19 +1042,12 @@ class ConditionalLlamaFlashAttnFunc(torch.autograd.Function):
                 "dropout_p": dropout_p,
                 "softmax_scale": softmax_scale,
                 "causal": causal,
-                "window_size_left": window_size[0],
-                "window_size_right": window_size[1],
+                "window_size": window_size,
                 "softcap": 0.0,
                 "alibi_slopes": alibi_slopes,
-                "return_softmax": True and dropout_p > 0,
             }
 
-            outputs = _wrapped_flash_attn_forward(**params)
-            if len(outputs) == 8:
-                out, _, _, _, _, softmax_lse, _, _ = outputs
-            else:
-                assert len(outputs) == 4
-                out, softmax_lse, _, _ = outputs
+            out, softmax_lse = _wrapped_flash_attn_forward(**params)
             ctx.bwd_event_sync = False
         else:
             # out shape (batch, seq, heads, head_dim)
@@ -1128,8 +1106,7 @@ class ConditionalLlamaFlashAttnFunc(torch.autograd.Function):
                 "dropout_p": ctx.dropout_p,
                 "softmax_scale": ctx.softmax_scale,
                 "causal": ctx.causal,
-                "window_size_left": ctx.window_size[0],
-                "window_size_right": ctx.window_size[1],
+                "window_size": ctx.window_size,
                 "softcap": 0.0,
                 "alibi_slopes": ctx.alibi_slopes,
                 "deterministic": ctx.deterministic,
@@ -1231,19 +1208,12 @@ class ConditionalLlamaRingFlashAttnFunc(torch.autograd.Function):
                 "dropout_p": dropout_p,
                 "softmax_scale": softmax_scale,
                 "causal": causal,
-                "window_size_left": window_size[0],
-                "window_size_right": window_size[1],
+                "window_size": window_size,
                 "softcap": 0.0,
                 "alibi_slopes": alibi_slopes,
-                "return_softmax": True and dropout_p > 0,
             }
 
-            outputs = _wrapped_flash_attn_forward(**params)
-            if len(outputs) == 8:
-                out, _, _, _, _, softmax_lse, _, _ = outputs
-            else:
-                assert len(outputs) == 4
-                out, softmax_lse, _, _ = outputs
+            out, softmax_lse = _wrapped_flash_attn_forward(**params)
             ctx.bwd_event_sync = False
         else:
             # out shape (batch, seq, heads, head_dim)

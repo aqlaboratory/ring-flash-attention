@@ -1,12 +1,12 @@
 import torch
-from flash_attn.flash_attn_interface import (
-    _flash_attn_varlen_forward,
-    _flash_attn_varlen_backward,
+from .flash_attn_backend import (
+    fa_varlen_forward,
+    fa_varlen_backward,
+    check_variant_supported,
 )
 from .utils import (
     RingComm,
     update_out_and_lse,
-    get_default_args,
 )
 
 try:
@@ -88,6 +88,7 @@ def zigzag_ring_flash_attn_varlen_forward(
     deterministic=False,
 ):
     assert causal == True, "zigzag ring is meaningless for causal=False"
+    check_variant_supported("zigzag_ring_flash_attn_varlen")
     comm = RingComm(process_group)
 
     block_seq_len = q.shape[0] // 2
@@ -107,40 +108,21 @@ def zigzag_ring_flash_attn_varlen_forward(
         cu_seqlens_kv = half_cu_seqlens if seqlen_kv == block_seq_len else cu_seqlens
         max_seqlen_kv = half_max_seqlen if seqlen_kv == block_seq_len else max_seqlen
 
-        params = get_default_args(_flash_attn_varlen_forward).copy()
-        params.update(
-            {
-                "q": q,
-                "k": k,
-                "v": v,
-                # the first half and the second half are the same
-                "cu_seqlens_q": cu_seqlens_q,
-                "cu_seqlens_k": cu_seqlens_kv,
-                "max_seqlen_q": max_seqlen_q,
-                "max_seqlen_k": max_seqlen_kv,
-                "dropout_p": dropout_p,
-                "softmax_scale": softmax_scale,
-                "causal": causal,
-                "alibi_slopes": alibi_slopes,
-                "return_softmax": True and dropout_p > 0,
-            }
+        return fa_varlen_forward(
+            q,
+            k,
+            v,
+            # the first half and the second half are the same
+            cu_seqlens_q,
+            cu_seqlens_kv,
+            max_seqlen_q,
+            max_seqlen_kv,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            alibi_slopes=alibi_slopes,
         )
-        if "window_size" in params:
-            params.update({"window_size": window_size})
-        else:
-            params.update(
-                {
-                    "window_size_left": window_size[0],
-                    "window_size_right": window_size[1],
-                }
-            )
-        outputs = _flash_attn_varlen_forward(**params)
-        if len(outputs) == 8:
-            block_out, _, _, _, _, block_lse, _, _ = outputs
-        else:
-            assert len(outputs) == 4
-            block_out, block_lse, _, _ = outputs
-        return block_out, block_lse
 
     old_lse = False
     for step in range(comm.world_size):
@@ -211,6 +193,7 @@ def zigzag_ring_flash_attn_varlen_backward(
     deterministic=False,
 ):
     assert causal == True, "zigzag ring is meaningless for causal=False"
+    check_variant_supported("zigzag_ring_flash_attn_varlen")
     kv_comm = RingComm(process_group)
     d_kv_comm = RingComm(process_group)
     dq, dk, dv = None, None, None
@@ -239,40 +222,28 @@ def zigzag_ring_flash_attn_varlen_backward(
         max_seqlen_q = half_max_seqlen if seqlen_q == block_seq_len else max_seqlen
         cu_seqlens_kv = half_cu_seqlens if seqlen_kv == block_seq_len else cu_seqlens
         max_seqlen_kv = half_max_seqlen if seqlen_kv == block_seq_len else max_seqlen
-        params = get_default_args(_flash_attn_varlen_backward).copy()
-        params.update(
-            {
-                "dout": dout,
-                "q": q,
-                "k": k,
-                "v": v,
-                "out": out,
-                "softmax_lse": softmax_lse,
-                "dq": dq_buffer[:seqlen_q],
-                "dk": dk_buffer[:seqlen_kv],
-                "dv": dv_buffer[:seqlen_kv],
-                # the first half and the second half are the same
-                "cu_seqlens_q": cu_seqlens_q,
-                "cu_seqlens_k": cu_seqlens_kv,
-                "max_seqlen_q": max_seqlen_q,
-                "max_seqlen_k": max_seqlen_kv,
-                "dropout_p": dropout_p,
-                "softmax_scale": softmax_scale,
-                "causal": causal,
-                "alibi_slopes": alibi_slopes,
-                "deterministic": deterministic,
-            }
+        fa_varlen_backward(
+            dout,
+            q,
+            k,
+            v,
+            out,
+            softmax_lse,
+            dq_buffer[:seqlen_q],
+            dk_buffer[:seqlen_kv],
+            dv_buffer[:seqlen_kv],
+            # the first half and the second half are the same
+            cu_seqlens_q,
+            cu_seqlens_kv,
+            max_seqlen_q,
+            max_seqlen_kv,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            alibi_slopes=alibi_slopes,
+            deterministic=deterministic,
         )
-        if "window_size" in params:
-            params.update({"window_size": window_size})
-        else:
-            params.update(
-                {
-                    "window_size_left": window_size[0],
-                    "window_size_right": window_size[1],
-                }
-            )
-        _flash_attn_varlen_backward(**params)
 
     for step in range(kv_comm.world_size):
         if step + 1 != kv_comm.world_size:
