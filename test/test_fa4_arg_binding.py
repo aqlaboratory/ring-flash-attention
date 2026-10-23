@@ -105,8 +105,18 @@ def strip_max_seqlen(signature):
     )
 
 
+def strip_params(signature, names):
+    return signature.replace(
+        parameters=[p for p in signature.parameters.values() if p.name not in names]
+    )
+
+
 class _FA4Case(unittest.TestCase):
     max_seqlen_supported = True
+    # bwd params absent from the build under test, and whether its bwd then allocates
+    # fresh gradients instead of writing into ours
+    bwd_missing = ()
+    bwd_reallocates = False
 
     @classmethod
     def setUpClass(cls):
@@ -117,10 +127,14 @@ class _FA4Case(unittest.TestCase):
         bwd_sig = signature_from_source(path, "_flash_attn_bwd")
         if not cls.max_seqlen_supported:
             fwd_sig, bwd_sig = strip_max_seqlen(fwd_sig), strip_max_seqlen(bwd_sig)
+        bwd_sig = strip_params(bwd_sig, cls.bwd_missing)
         cls.fwd_sig, cls.bwd_sig = fwd_sig, bwd_sig
         cls.dq, cls.dk, cls.dv = Buf(), Buf(), Buf()
+        cls.kernel_grads = (
+            (Buf(), Buf(), Buf()) if cls.bwd_reallocates else (cls.dq, cls.dk, cls.dv)
+        )
         cls.fwd = recorder(fwd_sig, ("OUT", "LSE"))
-        cls.bwd = recorder(bwd_sig, (cls.dq, cls.dk, cls.dv))
+        cls.bwd = recorder(bwd_sig, cls.kernel_grads)
         cm = fake_fa4_seam(fwd=cls.fwd, bwd=cls.bwd)
         cls.seam = cm.__enter__()
         cls.addClassCleanup(cm.__exit__, None, None, None)
@@ -242,6 +256,49 @@ class TestFA4OlderBuildWithoutMaxSeqlen(_FA4Case):
         args, kwargs = self.last(self.bwd)
         self.bwd_sig.bind(*args, **kwargs)
         self.assertNotIn("max_seqlen_k", kwargs)
+
+
+class TestFA4OlderBuildWithoutGradBuffers(_FA4Case):
+    """FA4 builds before preallocated grads (and ``deterministic``) reject those kwargs."""
+
+    bwd_missing = ("deterministic", "dq", "dk", "dv")
+    bwd_reallocates = True
+
+    def setUp(self):
+        super().setUp()
+        for buf in (self.dq, self.dk, self.dv):
+            buf.copied_from = None
+
+    def test_signature_really_lacks_them(self):
+        for name in self.bwd_missing:
+            self.assertNotIn(name, self.bwd_sig.parameters)
+
+    def test_backward_drops_them_and_copies_back(self):
+        for call in (
+            lambda: self.seam.fa_backward(
+                "DO", self.q, "K", "V", "O", "LSE", self.dq, self.dk, self.dv
+            ),
+            lambda: self.seam.fa_varlen_backward(
+                "DO", self.q, "K", "V", "O", "LSE", self.dq, self.dk, self.dv,
+                "CQ", "CK", 16, 32,
+            ),
+        ):
+            call()
+            args, kwargs = self.last(self.bwd)
+            self.bwd_sig.bind(*args, **kwargs)  # would raise TypeError if passed through
+            for name in self.bwd_missing:
+                self.assertNotIn(name, kwargs)
+            # the kernel's own gradients must land in the caller's buffers
+            for dst, src in zip((self.dq, self.dk, self.dv), self.kernel_grads):
+                self.assertIs(dst.copied_from, src)
+
+    def test_deterministic_true_is_refused_not_dropped(self):
+        with self.assertRaises(NotImplementedError):
+            self.seam.fa_backward(
+                "DO", self.q, "K", "V", "O", "LSE", self.dq, self.dk, self.dv,
+                deterministic=True,
+            )
+        self.assertEqual(self.bwd.calls, [])
 
 
 class TestMaxSeqlenCheckedPerFunction(unittest.TestCase):

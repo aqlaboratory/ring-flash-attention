@@ -91,6 +91,11 @@ def main():
     if lse.dim() == 2:
         log("lse", lse, rank0_only=True)
         log("lse diff", local_lse - llama3_lse)
+    elif rank == 0:
+        print(
+            f"lse diff: NOT CHECKED -- reference lse has shape {tuple(lse.shape)}, "
+            "expected 2-D (nheads, total_q)"
+        )
 
     dist.barrier()
     if rank == 0:

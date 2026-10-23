@@ -6,6 +6,7 @@ purely to get at ``select_backend`` and ``_requested_backend``.
 
 import os
 import unittest
+from unittest import mock
 
 from fa4_fakes import ENV_VAR, fake_fa4_seam
 
@@ -81,6 +82,28 @@ class SelectBackendTest(unittest.TestCase):
             self.seam.check_variant_supported("zigzag_ring_flash_attn")
         self.seam.check_variant_supported("llama3_flash_attn_varlen")
         self.seam.check_variant_supported("ring_flash_attn_forward")
+
+    def test_auto_records_why_it_skipped_fa2(self):
+        failures = []
+        self.seam.select_backend(
+            "auto", {"fa2": failing(OSError("bad .so")), "fa4": ok}, failures
+        )
+        self.assertEqual(failures, ["fa2: OSError: bad .so"])
+
+    def test_refusal_names_env_var_only_when_it_was_set(self):
+        with self.assertRaises(NotImplementedError) as cm:
+            self.seam.check_variant_supported("zigzag_ring_flash_attn")
+        self.assertIn(f"Unset {ENV_VAR}", str(cm.exception))
+
+    def test_refusal_after_auto_fallthrough_shows_the_fa2_failure(self):
+        # the variable is already unset here, so telling the user to unset it is useless
+        with mock.patch.object(self.seam, "_AUTO_SKIPPED", ["fa2: OSError: bad .so"]):
+            with self.assertRaises(NotImplementedError) as cm:
+                self.seam.check_variant_supported("zigzag_ring_flash_attn")
+        msg = str(cm.exception)
+        self.assertIn("fa2: OSError: bad .so", msg)
+        self.assertIn("Repair flash-attn 2.x", msg)
+        self.assertNotIn(f"Unset {ENV_VAR}", msg)
 
 
 class RequestedBackendTest(unittest.TestCase):

@@ -50,6 +50,7 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 import torch
+from torch.torch_version import TorchVersion
 
 from .utils import get_default_args
 
@@ -252,7 +253,7 @@ def _probe_fa4() -> None:
 _PROBES = {"fa2": _probe_fa2, "fa4": _probe_fa4}
 
 
-def select_backend(requested: str, probes=None) -> str:
+def select_backend(requested: str, probes=None, failures=None) -> str:
     """Resolve a requested backend name (possibly ``auto``) to ``fa2``/``fa3``/``fa4``.
 
     An explicit name is returned as-is, and the backend's own section below then loads it
@@ -260,6 +261,9 @@ def select_backend(requested: str, probes=None) -> str:
     in ``_AUTO_ORDER``; any failure counts (``ImportError``, ``OSError`` for a
     ``flash_attn_2_cuda`` .so that fails to load, ``RuntimeError`` for a torch ABI
     mismatch). The result is never ``auto`` -- ``BACKEND`` keys ``_VALIDATED_VARIANTS``.
+
+    ``failures``, if given, receives the reason for each backend ``auto`` skipped, so a
+    later error can explain why it did not land on an earlier one.
     """
     if requested not in _VALID_BACKENDS:
         raise ValueError(
@@ -269,7 +273,7 @@ def select_backend(requested: str, probes=None) -> str:
     if requested != "auto":
         return requested
     probes = _PROBES if probes is None else probes
-    failures = []
+    failures = [] if failures is None else failures
     for name in _AUTO_ORDER:
         try:
             probes[name]()
@@ -288,7 +292,9 @@ def _requested_backend() -> str:
     return os.environ.get(_ENV_VAR, "").strip().lower() or "auto"
 
 
-BACKEND = select_backend(_requested_backend())
+# Why ``auto`` skipped each earlier backend; empty unless it fell through.
+_AUTO_SKIPPED = []
+BACKEND = select_backend(_requested_backend(), failures=_AUTO_SKIPPED)
 
 
 def _set_window(params: dict, window_size) -> None:
@@ -351,10 +357,13 @@ if BACKEND == "fa2":
         ) from e
 
     # FA >= 2.7 registers the python entry points as torch library custom ops, which
-    # keeps them traceable under torch.compile. Preserved verbatim from the per-module
-    # gates this seam replaces, including the asymmetry that the backward gate does not
-    # consult flash_attn.__version__.
-    if torch.__version__ >= "2.4.0" and flash_attn.__version__ >= "2.7.0":
+    # keeps them traceable under torch.compile. Preserved from the per-module gates this
+    # seam replaces, including the asymmetry that the backward gate does not consult
+    # flash_attn.__version__. That version is a plain str, so it is wrapped in
+    # TorchVersion to compare numerically ("2.10.0" < "2.7.0" as strings).
+    if torch.__version__ >= "2.4.0" and (
+        TorchVersion(flash_attn.__version__) >= "2.7.0"
+    ):
         _wrapped_flash_attn_forward = torch.ops.flash_attn._flash_attn_forward
     else:
         _wrapped_flash_attn_forward = _flash_attn_forward
@@ -887,6 +896,25 @@ elif BACKEND == "fa4":
             return {}
         return dict(max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k)
 
+    def _bwd_grad_kwargs(fn, deterministic, dq, dk, dv) -> dict:
+        """Older FA4 builds lack ``deterministic`` and the preallocated ``dq``/``dk``/``dv``.
+
+        Dropping the buffers is safe: the kernel then allocates its own and ``_copy_back``
+        copies them over. ``deterministic`` is only dropped while False -- asking for it
+        on a build that cannot honour it raises instead of silently running without it.
+        """
+        kwargs = {}
+        if _accepts(fn, "deterministic"):
+            kwargs["deterministic"] = deterministic
+        elif deterministic:
+            raise NotImplementedError(
+                "this flash-attn-4 build's backward has no `deterministic` argument; "
+                "upgrade flash-attn-4 or pass deterministic=False."
+            )
+        if _accepts(fn, "dq"):
+            kwargs.update(dq=dq, dk=dk, dv=dv)
+        return kwargs
+
     # Forward accepts sm_80 and up; backward is sm_90 and up.
     _MIN_BACKWARD_MAJOR = 9
 
@@ -980,10 +1008,7 @@ elif BACKEND == "fa4":
             softcap=softcap,
             window_size_left=window_left,
             window_size_right=window_right,
-            deterministic=deterministic,
-            dq=dq,
-            dk=dk,
-            dv=dv,
+            **_bwd_grad_kwargs(_flash_attn_bwd, deterministic, dq, dk, dv),
         )
         _copy_back(dq, dk, dv, out_dq, out_dk, out_dv)
 
@@ -1063,10 +1088,7 @@ elif BACKEND == "fa4":
             window_size_right=window_right,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
-            deterministic=deterministic,
-            dq=dq,
-            dk=dk,
-            dv=dv,
+            **_bwd_grad_kwargs(_flash_attn_bwd, deterministic, dq, dk, dv),
             **_max_seqlen_kwargs(_flash_attn_bwd, max_seqlen_q, max_seqlen_k),
         )
         _copy_back(dq, dk, dv, out_dq, out_dk, out_dv)
@@ -1143,10 +1165,18 @@ def check_variant_supported(variant: str) -> None:
     """
     in_scope = _VALIDATED_VARIANTS.get(BACKEND)
     if in_scope is not None and variant not in in_scope:
+        if _AUTO_SKIPPED:
+            # auto fell through, so the env var is already unset; the fix is fa2 itself.
+            remedy = (
+                f"{BACKEND} was picked by {_ENV_VAR}=auto because an earlier backend "
+                f"failed to load ({'; '.join(_AUTO_SKIPPED)}). Repair flash-attn 2.x "
+                "to use this variant."
+            )
+        else:
+            remedy = f"Unset {_ENV_VAR} (or set it to fa2) to use this variant."
         raise NotImplementedError(
             f"'{variant}' is not in scope for the "
             f"{_BACKEND_DISPLAY_NAME.get(BACKEND, BACKEND)} backend, so it is refused "
             f"rather than run with unverified numerics. In scope under {BACKEND}: "
-            f"{', '.join(sorted(in_scope))}. "
-            f"Unset {_ENV_VAR} (or set it to fa2) to use this variant."
+            f"{', '.join(sorted(in_scope))}. {remedy}"
         )
