@@ -46,6 +46,9 @@ def seam_reference_attn(q, k, v, dout, causal, softmax_scale=None):
     flash-attn-4 alone, where `from flash_attn import flash_attn_*_func` does not exist.
     Inputs are (batch, seqlen, nheads, d); returns out, lse (batch, nheads, seqlen) and
     dq, dk, dv.
+
+    Because it shares the seam with the ring path, a seam bug cancels out in ring-vs-this
+    comparisons. test_seam_reference.py checks this function against plain PyTorch.
     """
     from ring_flash_attn.flash_attn_backend import fa_backward, fa_forward
 

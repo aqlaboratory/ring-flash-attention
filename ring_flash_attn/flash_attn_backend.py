@@ -918,14 +918,25 @@ elif BACKEND == "fa4":
     # Forward accepts sm_80 and up; backward is sm_90 and up.
     _MIN_BACKWARD_MAJOR = 9
 
-    def _check_backward_arch(device) -> None:
+    def _check_backward_arch(device, deterministic) -> None:
         major, minor = torch.cuda.get_device_capability(device)
         if major < _MIN_BACKWARD_MAJOR:
             raise RuntimeError(
                 f"flash-attn-4 backward requires compute capability "
                 f"{_MIN_BACKWARD_MAJOR}.0+, but this device is sm_{major}{minor}. "
                 "FA4 forward works on sm_80+; only the backward kernel is gated. "
-                "Use RING_FLASH_ATTN_BACKEND=fa2 to train on this device."
+                f"Use {_ENV_VAR}=fa2 to train on this device."
+            )
+        # FA4's sm_12x backward (consumer/workstation Blackwell, added upstream in
+        # 921f70c) is a reduced SM80-style port without the dQ/dK/dV semaphores that
+        # deterministic mode needs, and refuses it with a bare assert -- which `python -O`
+        # strips. sm_100 (B200) is unaffected.
+        if major == 12 and deterministic:
+            raise RuntimeError(
+                f"flash-attn-4 has no deterministic backward on sm_{major}{minor} "
+                "(consumer/workstation Blackwell); upstream implements it only for "
+                "datacenter GPUs such as sm_90 and sm_100. Pass deterministic=False, or "
+                f"use {_ENV_VAR}=fa2 if your flash-attn 2.x build supports this GPU."
             )
 
     def _split_window(window_size) -> Tuple[Optional[int], Optional[int]]:
@@ -993,7 +1004,7 @@ elif BACKEND == "fa4":
         use_custom_op=True,  # accepted and ignored: FA4 registers no torch ops
     ):
         _check_unsupported(dropout_p, alibi_slopes)
-        _check_backward_arch(q.device)
+        _check_backward_arch(q.device, deterministic)
         window_left, window_right = _split_window(window_size)
         # Newer FA4 may append extras (e.g. dsink); we only pass what yields dq/dk/dv.
         out_dq, out_dk, out_dv, *_ = _flash_attn_bwd(
@@ -1071,7 +1082,7 @@ elif BACKEND == "fa4":
         deterministic=False,
     ):
         _check_unsupported(dropout_p, alibi_slopes)
-        _check_backward_arch(q.device)
+        _check_backward_arch(q.device, deterministic)
         window_left, window_right = _split_window(window_size)
         # Newer FA4 may append extras (e.g. dsink); we only pass what yields dq/dk/dv.
         out_dq, out_dk, out_dv, *_ = _flash_attn_bwd(

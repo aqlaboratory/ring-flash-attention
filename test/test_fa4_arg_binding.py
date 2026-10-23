@@ -232,6 +232,42 @@ class TestFA4ArgBinding(_FA4Case):
                     "DO", self.q, "K", "V", "O", "LSE", self.dq, self.dk, self.dv
                 )
 
+    def test_deterministic_refused_on_sm12x_before_the_kernel(self):
+        # FA4's own refusal is a bare assert; ours must fire first, for both entry points
+        for cap in ((12, 0), (12, 1)):
+            with self.subTest(cap=cap), mock.patch(
+                "torch.cuda.get_device_capability", return_value=cap
+            ):
+                with self.assertRaisesRegex(RuntimeError, "deterministic=False"):
+                    self.seam.fa_backward(
+                        "DO", self.q, "K", "V", "O", "LSE", self.dq, self.dk, self.dv,
+                        deterministic=True,
+                    )
+                with self.assertRaisesRegex(RuntimeError, "deterministic=False"):
+                    self.seam.fa_varlen_backward(
+                        "DO", self.q, "K", "V", "O", "LSE", self.dq, self.dk, self.dv,
+                        "CQ", "CK", 16, 32, deterministic=True,
+                    )
+                self.assertEqual(self.bwd.calls, [])
+                # non-deterministic backward still reaches the kernel there
+                self.seam.fa_backward(
+                    "DO", self.q, "K", "V", "O", "LSE", self.dq, self.dk, self.dv
+                )
+                self.assertEqual(len(self.bwd.calls), 1)
+                self.bwd.calls.clear()
+
+    def test_deterministic_allowed_on_datacenter_parts(self):
+        for cap in ((9, 0), (10, 0)):
+            with self.subTest(cap=cap), mock.patch(
+                "torch.cuda.get_device_capability", return_value=cap
+            ):
+                self.seam.fa_backward(
+                    "DO", self.q, "K", "V", "O", "LSE", self.dq, self.dk, self.dv,
+                    deterministic=True,
+                )
+                _, kwargs = self.last(self.bwd)
+                self.assertIs(kwargs["deterministic"], True)
+
 
 class TestFA4OlderBuildWithoutMaxSeqlen(_FA4Case):
     """Older FA4 builds infer max seqlens from cu_seqlens and reject the kwargs."""
