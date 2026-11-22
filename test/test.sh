@@ -18,6 +18,8 @@ tests=(
   test_zigzag_ring_flash_attn_func.py
   test_zigzag_ring_flash_attn_varlen_func.py
   test_cond_llama_fwd_ring_bwd_flash_attn.py
+  test_llama_flash_attn.py
+  test_llama_fwd_ring_bwd_flash_attn.py
   test_pack_first_stride.py
   test_llama_stride_flags.py
 )
@@ -33,7 +35,9 @@ declare -A test_variants=(
   [test_zigzag_ring_flash_attn_func.py]="zigzag_ring_flash_attn"
   [test_zigzag_ring_flash_attn_varlen_func.py]="zigzag_ring_flash_attn_varlen"
   [test_cond_llama_fwd_ring_bwd_flash_attn.py]="llama_fwd_ring_bwd_flash_attn"
-  [test_pack_first_stride.py]=""
+  [test_llama_flash_attn.py]="llama_fwd_ring_bwd_flash_attn"
+  [test_llama_fwd_ring_bwd_flash_attn.py]="llama_fwd_ring_bwd_flash_attn"
+  [test_pack_first_stride.py]="llama_fwd_ring_bwd_flash_attn"
   [test_llama_stride_flags.py]="llama_fwd_ring_bwd_flash_attn"
 )
 

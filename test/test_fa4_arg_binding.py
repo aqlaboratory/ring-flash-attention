@@ -333,6 +333,46 @@ class TestFA4ArgBinding(_FA4Case):
                 _, kwargs = self.last(self.bwd)
                 self.assertIs(kwargs["deterministic"], True)
 
+    def test_softcap_refused_in_varlen_backward_before_the_kernel(self):
+        # FA4 turns softcap into a score_mod, then refuses score_mod + cu_seqlens in its
+        # backward with a bare assert; ours must fire first.
+        with self.assertRaisesRegex(NotImplementedError, "softcap=0.0"):
+            self.seam.fa_varlen_backward(
+                "DO",
+                self.q,
+                "K",
+                "V",
+                "O",
+                "LSE",
+                self.dq,
+                self.dk,
+                self.dv,
+                "CQ",
+                "CK",
+                16,
+                32,
+                softcap=30.0,
+            )
+        self.assertEqual(self.bwd.calls, [])
+
+    def test_softcap_still_reaches_the_kernel_elsewhere(self):
+        # varlen forward (inference) and dense backward are not affected by the guard
+        self.seam.fa_varlen_forward("Q", "K", "V", "CQ", "CK", 16, 32, softcap=30.0)
+        self.assertEqual(self.last(self.fwd)[1]["softcap"], 30.0)
+        self.seam.fa_backward(
+            "DO",
+            self.q,
+            "K",
+            "V",
+            "O",
+            "LSE",
+            self.dq,
+            self.dk,
+            self.dv,
+            softcap=30.0,
+        )
+        self.assertEqual(self.last(self.bwd)[1]["softcap"], 30.0)
+
 
 class TestFA4OlderBuildWithoutMaxSeqlen(_FA4Case):
     """Older FA4 builds infer max seqlens from cu_seqlens and reject the kwargs."""

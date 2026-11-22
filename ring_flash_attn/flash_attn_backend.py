@@ -35,9 +35,11 @@ Three backends are available:
 
 ``fa4``
     ``flash_attn.cute.interface`` (FlashAttention 4, distributed as ``flash-attn-4``).
-    Opt in with ``RING_FLASH_ATTN_BACKEND=fa4``. No dropout, no ALiBi, and no
-    ``torch.library`` registration upstream, so it is not traceable under
-    ``torch.compile``. Its backward additionally requires compute capability 9.0+.
+    Picked by ``auto`` when ``fa2`` does not load, or explicitly with
+    ``RING_FLASH_ATTN_BACKEND=fa4``. No dropout, no ALiBi, and no ``torch.library``
+    registration upstream, so it is not traceable under ``torch.compile``. Its backward
+    additionally requires compute capability 9.0+, and its varlen backward refuses a
+    non-zero ``softcap``.
 """
 
 import functools
@@ -205,10 +207,13 @@ def available_backends() -> Tuple[str, ...]:
 class Capabilities:
     """What the active backend actually supports.
 
-    Every flag gates a real call-time check in this module. Properties that no ring
-    code can act on (such as ``torch.compile`` traceability) are documented rather
-    than expressed here, so nothing in this record can be mistaken for a runtime
-    guard that does not exist.
+    Only ``supports_dropout`` and ``supports_alibi`` are enforced, by
+    ``_check_unsupported``. ``supports_softcap``, ``supports_window`` and
+    ``supports_backward`` are descriptive: they say what the backend broadly supports,
+    and narrower refusals (FA4's per-device backward gate, its lack of a softcapped
+    varlen backward) are raised by that backend's adapter functions, not derived from
+    these flags. Properties no ring code can act on (such as ``torch.compile``
+    traceability) are documented rather than expressed here.
     """
 
     def __init__(
@@ -369,7 +374,17 @@ if BACKEND == "fa2":
         _wrapped_flash_attn_forward = _flash_attn_forward
 
     if torch.__version__ >= "2.4.0":
-        _wrapped_flash_attn_backward = torch.ops.flash_attn._flash_attn_backward
+        try:
+            _wrapped_flash_attn_backward = torch.ops.flash_attn._flash_attn_backward
+        except AttributeError as e:
+            # Same selection as before; this only replaces torch.ops' bare
+            # AttributeError with one that names the cause.
+            raise ImportError(
+                "ring_flash_attn requires torch.ops.flash_attn._flash_attn_backward "
+                f"on torch>=2.4 (found torch {torch.__version__}), but flash-attn "
+                f"{flash_attn.__version__} does not register it. Upgrade flash-attn "
+                "to 2.7.0 or newer."
+            ) from e
     else:
         _wrapped_flash_attn_backward = _flash_attn_backward
 
@@ -897,7 +912,7 @@ elif BACKEND == "fa4":
         name="fa4",
         supports_dropout=False,
         supports_alibi=False,
-        supports_softcap=True,
+        supports_softcap=True,  # except varlen backward, see fa_varlen_backward
         supports_window=True,
         supports_backward=True,  # gated per-device, see _check_backward_arch
     )
@@ -1105,6 +1120,17 @@ elif BACKEND == "fa4":
     ):
         _check_unsupported(dropout_p, alibi_slopes)
         _check_backward_arch(q.device, deterministic)
+        # FA4 implements softcap as a score_mod, and its backward refuses score_mod with
+        # cu_seqlens via a bare assert -- which `python -O` strips, leaving an
+        # unsupported kernel path. Checked here rather than in the forward so that
+        # softcapped varlen inference keeps working.
+        if softcap:
+            raise NotImplementedError(
+                "flash-attn-4 has no varlen backward with softcap; got "
+                f"softcap={softcap}. The forward pass is unaffected. To train "
+                "through the varlen ring paths on FA4, pass softcap=0.0, or use "
+                f"{_ENV_VAR}=fa2."
+            )
         window_left, window_right = _split_window(window_size)
         # Newer FA4 may append extras (e.g. dsink); we only pass what yields dq/dk/dv.
         out_dq, out_dk, out_dv, *_ = _flash_attn_bwd(
@@ -1147,8 +1173,8 @@ elif BACKEND == "fa4":
 def _check_unsupported(dropout_p, alibi_slopes) -> None:
     """Fail loudly rather than silently dropping an argument the backend cannot honour.
 
-    Reads CAPABILITIES so the flags are load-bearing rather than descriptive. Under fa2
-    every flag is True and this is a no-op.
+    Reads CAPABILITIES, so these two flags are load-bearing rather than descriptive.
+    Under fa2 both are True and this is a no-op.
     """
     if dropout_p and not CAPABILITIES.supports_dropout:
         raise NotImplementedError(
