@@ -53,7 +53,7 @@ def main():
 
     # --- Test Subject: Ring Attention ---
     fn = llama_flash_attn_func 
-    
+
     # local_qkv (B, S, H, D, qkv)
     ring_out, ring_lse, _ = fn(
         local_qkv[:,:,0], 
@@ -90,7 +90,7 @@ def main():
     ring_dqkv = local_qkv.grad
 
     log("local_dqkv", local_dqkv)
-    
+
     # Shape is (Batch, Seq, 3, Heads, Dim). We slice dim 2.
     log("dq diff", local_dqkv[:, :, 0] - ring_dqkv[:, :, 0])
     log("dk diff", local_dqkv[:, :, 1] - ring_dqkv[:, :, 1])

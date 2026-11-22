@@ -27,7 +27,10 @@ def run_scenario(**scenario):
     env["PYTHONPATH"] = os.pathsep.join([str(REPO_ROOT), str(TEST_DIR)])
     return subprocess.run(
         [sys.executable, "-c", COLD_IMPORT_SCRIPT, json.dumps(scenario)],
-        cwd=REPO_ROOT, env=env, capture_output=True, text=True,
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
     )
 
 
@@ -36,7 +39,9 @@ class ColdImportTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
         line = [l for l in proc.stdout.splitlines() if l.startswith("RESULT")][-1]
         backend, has_variant = line.split()[1:]
-        self.assertEqual(has_variant, "True")  # the package, not just the seam, imported
+        self.assertEqual(
+            has_variant, "True"
+        )  # the package, not just the seam, imported
         return backend
 
     def test_fa4_only_install_auto_selects_fa4(self):

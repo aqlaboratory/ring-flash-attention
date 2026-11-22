@@ -85,7 +85,9 @@ def _hiding_metadata(real):
     """
 
     def wrapper(name, *args, **kwargs):
-        if name.lower().replace("_", "-") in {n.replace("_", "-") for n in _HIDDEN_DISTRIBUTIONS}:
+        if name.lower().replace("_", "-") in {
+            n.replace("_", "-") for n in _HIDDEN_DISTRIBUTIONS
+        }:
             raise importlib.metadata.PackageNotFoundError(name)
         return real(name, *args, **kwargs)
 
@@ -115,9 +117,7 @@ def fake_environment(
     unset the variable.
     """
     saved_modules = {
-        k: v
-        for k, v in sys.modules.items()
-        if k.split(".")[0] in _PURGED_PREFIXES
+        k: v for k, v in sys.modules.items() if k.split(".")[0] in _PURGED_PREFIXES
     }
     for k in saved_modules:
         del sys.modules[k]

@@ -56,7 +56,9 @@ class SelectBackendTest(unittest.TestCase):
         # even with a perfectly good fa3 probe on offer
         with self.assertRaises(ImportError) as cm:
             self.select(
-                "auto", fa2=failing(ImportError("a")), fa4=failing(ImportError("b")),
+                "auto",
+                fa2=failing(ImportError("a")),
+                fa4=failing(ImportError("b")),
                 fa3=ok,
             )
         self.assertIn("never auto-selected", str(cm.exception))

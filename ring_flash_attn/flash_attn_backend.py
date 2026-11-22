@@ -277,7 +277,7 @@ def select_backend(requested: str, probes=None, failures=None) -> str:
     for name in _AUTO_ORDER:
         try:
             probes[name]()
-        except Exception as e:  # noqa: PERF203 - the reason for each backend is reported
+        except Exception as e:  # noqa: PERF203 - each failure is reported
             failures.append(f"{name}: {type(e).__name__}: {e}")
             continue
         return name
@@ -572,7 +572,9 @@ elif BACKEND == "fa3":
     if FA3_MODULE is None:
         raise ImportError(
             "ring_flash_attn found flash_attn_3._C but could not import the flash-attn-3 "
-            "interface module. Tried:\n  " + "\n  ".join(_fa3_errors) + f"\n{_FA3_INSTALL_HINT}."
+            "interface module. Tried:\n  "
+            + "\n  ".join(_fa3_errors)
+            + f"\n{_FA3_INSTALL_HINT}."
         )
 
     _flash_attn_forward = _fa3._flash_attn_forward
@@ -595,7 +597,9 @@ elif BACKEND == "fa3":
     }
     _fa3_config_candidates = []
     if "." in FA3_MODULE:
-        _fa3_config_candidates.append(FA3_MODULE.rsplit(".", 1)[0] + ".flash_attn_config")
+        _fa3_config_candidates.append(
+            FA3_MODULE.rsplit(".", 1)[0] + ".flash_attn_config"
+        )
     _fa3_config_candidates.append("flash_attn_config")
 
     try:
@@ -641,7 +645,9 @@ elif BACKEND == "fa3":
     # handles the CustomOpDef via its `_init_fn` fallback and is cached per function,
     # so this costs nothing per ring step.
     _FA3_BWD_CAUSAL_KEY = (
-        "is_causal" if "is_causal" in get_default_args(_flash_attn_backward) else "causal"
+        "is_causal"
+        if "is_causal" in get_default_args(_flash_attn_backward)
+        else "causal"
     )
 
     def _fa3_forward_params(
@@ -718,7 +724,15 @@ elif BACKEND == "fa3":
         use_custom_op=True,  # accepted and ignored: the FA3 symbols *are* the custom ops
     ):
         params = _fa3_forward_params(
-            q, k, v, softmax_scale, causal, window_size, softcap, dropout_p, alibi_slopes
+            q,
+            k,
+            v,
+            softmax_scale,
+            causal,
+            window_size,
+            softcap,
+            dropout_p,
+            alibi_slopes,
         )
         outputs = _flash_attn_forward(**params)
         # (out, softmax_lse, out_accum, softmax_lse_accum); the accum pair is empty
@@ -785,7 +799,15 @@ elif BACKEND == "fa3":
         alibi_slopes=None,
     ):
         params = _fa3_forward_params(
-            q, k, v, softmax_scale, causal, window_size, softcap, dropout_p, alibi_slopes
+            q,
+            k,
+            v,
+            softmax_scale,
+            causal,
+            window_size,
+            softcap,
+            dropout_p,
+            alibi_slopes,
         )
         params.update(
             {
@@ -1165,7 +1187,11 @@ _VALIDATED_VARIANTS = {
     ),
 }
 
-_BACKEND_DISPLAY_NAME = {"fa2": "flash-attn 2.x", "fa3": "flash-attn-3", "fa4": "flash-attn-4"}
+_BACKEND_DISPLAY_NAME = {
+    "fa2": "flash-attn 2.x",
+    "fa3": "flash-attn-3",
+    "fa4": "flash-attn-4",
+}
 
 
 def check_variant_supported(variant: str) -> None:

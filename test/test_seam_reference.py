@@ -59,8 +59,13 @@ def naive_varlen_attn(q, k, v, dout, cu_q, cu_k, causal, softmax_scale, upcast):
         sq, sk = slice(cu_q[i], cu_q[i + 1]), slice(cu_k[i], cu_k[i + 1])
         outs.append(
             naive_attn(
-                q[None, sq], k[None, sk], v[None, sk], dout[None, sq],
-                causal, softmax_scale, upcast,
+                q[None, sq],
+                k[None, sk],
+                v[None, sk],
+                dout[None, sq],
+                causal,
+                softmax_scale,
+                upcast,
             )
         )
     out, lse, dq, dk, dv = zip(*outs)
@@ -88,7 +93,9 @@ def check(case, got, ref, ref_lowp):
     names = ("out", "lse", "dq", "dk", "dv")
     for name, g, r, rl in zip(names, got, ref, ref_lowp):
         if g.shape != r.shape:
-            FAILURES.append(f"{case} {name}: shape {tuple(g.shape)} != {tuple(r.shape)}")
+            FAILURES.append(
+                f"{case} {name}: shape {tuple(g.shape)} != {tuple(r.shape)}"
+            )
             print(f"  {name:3} SHAPE MISMATCH {tuple(g.shape)} vs {tuple(r.shape)}")
             continue
         err = (g.float() - r.float()).abs().max().item()
@@ -126,7 +133,11 @@ def varlen_case(causal, softmax_scale, nheads, nheads_k, d):
     cu = [0, 120, 1248, 2232]
     cu_t = torch.tensor(cu, dtype=torch.int32, device=DEVICE)
     max_seqlen = max(b - a for a, b in zip(cu, cu[1:]))
-    q, k, v = randn(cu[-1], nheads, d), randn(cu[-1], nheads_k, d), randn(cu[-1], nheads_k, d)
+    q, k, v = (
+        randn(cu[-1], nheads, d),
+        randn(cu[-1], nheads_k, d),
+        randn(cu[-1], nheads_k, d),
+    )
     dout = randn(cu[-1], nheads, d)
     out, lse, dq, dk, dv = seam_reference_varlen_attn(
         q, k, v, dout, cu_t, max_seqlen, causal, softmax_scale=softmax_scale
@@ -160,8 +171,21 @@ def varlen_cross_case(d):
     )
     dq, dk, dv = (torch.empty_like(t) for t in (q, k, v))
     fa_varlen_backward(
-        dout, q, k, v, out, lse, dq, dk, dv, cu_q_t, cu_k_t, max_q, max_k,
-        softmax_scale=scale, causal=False,
+        dout,
+        q,
+        k,
+        v,
+        out,
+        lse,
+        dq,
+        dk,
+        dv,
+        cu_q_t,
+        cu_k_t,
+        max_q,
+        max_k,
+        softmax_scale=scale,
+        causal=False,
     )
     got = (out, varlen_lse_to_packed(lse, cu_q), dq, dk, dv)
     ref = naive_varlen_attn(q, k, v, dout, cu_q, cu_k, False, scale, upcast=True)

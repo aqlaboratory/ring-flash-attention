@@ -4,7 +4,6 @@ from .flash_attn_backend import fa_varlen_forward, fa_varlen_backward
 import logging
 from .utils import AllGatherComm as Comm
 
-
 def llama3_flash_attn_prepare_cu_seqlens(
     cu_seqlens: torch.Tensor, causal: bool, rank: int, world_size: int
 ):
@@ -116,7 +115,7 @@ def llama3_flash_attn_varlen_forward(
         q_i = q[:, i * nheads // nheads_k : (i + heads_k_stride) * nheads // nheads_k]
         k_i = kv_buffer[0][local_k_slice]
         v_i = kv_buffer[1][local_k_slice]
-        # logging.debug(f"fwd i {i} k_ishape {k_i.shape} q.shape {q.shape} kv_buffer[0] {kv_buffer[0].shape} local_k_slice {local_k_slice}")     
+        # logging.debug(f"fwd i {i} k_ishape {k_i.shape} q.shape {q.shape} kv_buffer[0] {kv_buffer[0].shape} local_k_slice {local_k_slice}")
 
         out, lse = fa_varlen_forward(
             q_i,
@@ -230,7 +229,7 @@ def llama3_flash_attn_varlen_backward(
         v_i = kv_buffer[1][local_k_slice]
         dk_i = dkv_buffer[0][local_k_slice]
         dv_i = dkv_buffer[1][local_k_slice]
-        # logging.debug(f"bwd i {i} q_slice {q_slice} k_ishape {k_i.shape} dv_i.shape {dv_i.shape} q.shape {q.shape}")  
+        # logging.debug(f"bwd i {i} q_slice {q_slice} k_ishape {k_i.shape} dv_i.shape {dv_i.shape} q.shape {q.shape}")
 
         fa_varlen_backward(
             dout_i,

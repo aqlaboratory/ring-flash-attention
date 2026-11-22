@@ -256,9 +256,15 @@ class TestFA3AdapterParams(unittest.TestCase):
 
     def test_adapter_forward_params_bind(self):
         params = self.seam._fa3_forward_params(
-            q="Q", k="K", v="V",
-            softmax_scale=0.125, causal=True, window_size=(-1, -1),
-            softcap=0.0, dropout_p=0.0, alibi_slopes=None,
+            q="Q",
+            k="K",
+            v="V",
+            softmax_scale=0.125,
+            causal=True,
+            window_size=(-1, -1),
+            softcap=0.0,
+            dropout_p=0.0,
+            alibi_slopes=None,
         )
         bound = self.fwd_sig.bind(**params)  # must not raise
         self.assertEqual(bound.arguments["causal"], True)
@@ -269,10 +275,22 @@ class TestFA3AdapterParams(unittest.TestCase):
     def test_adapter_backward_params_bind_and_place_grads(self):
         dq, dk, dv = object(), object(), object()
         params = self.seam._fa3_backward_params(
-            dout="DO", q="Q", k="K", v="V", out="O", softmax_lse="LSE",
-            dq=dq, dk=dk, dv=dv,
-            softmax_scale=0.125, causal=True, window_size=(-1, -1),
-            softcap=0.0, deterministic=False, dropout_p=0.0, alibi_slopes=None,
+            dout="DO",
+            q="Q",
+            k="K",
+            v="V",
+            out="O",
+            softmax_lse="LSE",
+            dq=dq,
+            dk=dk,
+            dv=dv,
+            softmax_scale=0.125,
+            causal=True,
+            window_size=(-1, -1),
+            softcap=0.0,
+            deterministic=False,
+            dropout_p=0.0,
+            alibi_slopes=None,
         )
         bound = self.bwd_sig.bind(**params)  # must not raise
         self.assertIs(bound.arguments["dq"], dq)
@@ -284,15 +302,31 @@ class TestFA3AdapterParams(unittest.TestCase):
     def test_adapter_varlen_backward_params_bind(self):
         dq, dk, dv = object(), object(), object()
         params = self.seam._fa3_backward_params(
-            dout="DO", q="Q", k="K", v="V", out="O", softmax_lse="LSE",
-            dq=dq, dk=dk, dv=dv,
-            softmax_scale=0.125, causal=True, window_size=(-1, -1),
-            softcap=0.0, deterministic=False, dropout_p=0.0, alibi_slopes=None,
+            dout="DO",
+            q="Q",
+            k="K",
+            v="V",
+            out="O",
+            softmax_lse="LSE",
+            dq=dq,
+            dk=dk,
+            dv=dv,
+            softmax_scale=0.125,
+            causal=True,
+            window_size=(-1, -1),
+            softcap=0.0,
+            deterministic=False,
+            dropout_p=0.0,
+            alibi_slopes=None,
         )
-        params.update({
-            "cu_seqlens_q": "CQ", "cu_seqlens_k": "CK",
-            "max_seqlen_q": 16, "max_seqlen_k": 32,
-        })
+        params.update(
+            {
+                "cu_seqlens_q": "CQ",
+                "cu_seqlens_k": "CK",
+                "max_seqlen_q": 16,
+                "max_seqlen_k": 32,
+            }
+        )
         bound = self.bwd_sig.bind(**params)
         self.assertIs(bound.arguments["dq"], dq)
         self.assertEqual(bound.arguments["cu_seqlens_q"], "CQ")
@@ -301,13 +335,27 @@ class TestFA3AdapterParams(unittest.TestCase):
     def test_adapter_rejects_dropout_and_alibi(self):
         with self.assertRaises(NotImplementedError):
             self.seam._fa3_forward_params(
-                q="Q", k="K", v="V", softmax_scale=0.125, causal=True,
-                window_size=(-1, -1), softcap=0.0, dropout_p=0.1, alibi_slopes=None,
+                q="Q",
+                k="K",
+                v="V",
+                softmax_scale=0.125,
+                causal=True,
+                window_size=(-1, -1),
+                softcap=0.0,
+                dropout_p=0.1,
+                alibi_slopes=None,
             )
         with self.assertRaises(NotImplementedError):
             self.seam._fa3_forward_params(
-                q="Q", k="K", v="V", softmax_scale=0.125, causal=True,
-                window_size=(-1, -1), softcap=0.0, dropout_p=0.0, alibi_slopes="SLOPES",
+                q="Q",
+                k="K",
+                v="V",
+                softmax_scale=0.125,
+                causal=True,
+                window_size=(-1, -1),
+                softcap=0.0,
+                dropout_p=0.0,
+                alibi_slopes="SLOPES",
             )
 
     def _assert_extras_are_declared_defaults(self, params, explicit, sig):
@@ -328,32 +376,70 @@ class TestFA3AdapterParams(unittest.TestCase):
                 # setting all of those explicitly, or the call is malformed.
                 self.fail(f"{name} is required but not set explicitly (got {value!r})")
             self.assertEqual(
-                value, declared, f"{name} passed as {value!r}, declared default {declared!r}"
+                value,
+                declared,
+                f"{name} passed as {value!r}, declared default {declared!r}",
             )
 
     def test_forward_extras_equal_declared_defaults(self):
         params = self.seam._fa3_forward_params(
-            q="Q", k="K", v="V",
-            softmax_scale=0.125, causal=True, window_size=(-1, -1),
-            softcap=0.0, dropout_p=0.0, alibi_slopes=None,
+            q="Q",
+            k="K",
+            v="V",
+            softmax_scale=0.125,
+            causal=True,
+            window_size=(-1, -1),
+            softcap=0.0,
+            dropout_p=0.0,
+            alibi_slopes=None,
         )
         explicit = {
-            "q", "k", "v", "softmax_scale", "causal", "softcap",
-            "window_size_left", "window_size_right",
+            "q",
+            "k",
+            "v",
+            "softmax_scale",
+            "causal",
+            "softcap",
+            "window_size_left",
+            "window_size_right",
         }
         self._assert_extras_are_declared_defaults(params, explicit, self.fwd_sig)
 
     def test_backward_extras_equal_declared_defaults(self):
         params = self.seam._fa3_backward_params(
-            dout="DO", q="Q", k="K", v="V", out="O", softmax_lse="LSE",
-            dq="DQ", dk="DK", dv="DV",
-            softmax_scale=0.125, causal=True, window_size=(-1, -1),
-            softcap=0.0, deterministic=False, dropout_p=0.0, alibi_slopes=None,
+            dout="DO",
+            q="Q",
+            k="K",
+            v="V",
+            out="O",
+            softmax_lse="LSE",
+            dq="DQ",
+            dk="DK",
+            dv="DV",
+            softmax_scale=0.125,
+            causal=True,
+            window_size=(-1, -1),
+            softcap=0.0,
+            deterministic=False,
+            dropout_p=0.0,
+            alibi_slopes=None,
         )
         explicit = {
-            "dout", "q", "k", "v", "out", "softmax_lse", "dq", "dk", "dv",
-            "softmax_scale", "is_causal", "softcap", "deterministic",
-            "window_size_left", "window_size_right",
+            "dout",
+            "q",
+            "k",
+            "v",
+            "out",
+            "softmax_lse",
+            "dq",
+            "dk",
+            "dv",
+            "softmax_scale",
+            "is_causal",
+            "softcap",
+            "deterministic",
+            "window_size_left",
+            "window_size_right",
         }
         self._assert_extras_are_declared_defaults(params, explicit, self.bwd_sig)
 

@@ -50,21 +50,33 @@ def signature_from_source(path, func_name):
                 )
                 params.append(
                     inspect.Parameter(
-                        arg.arg, kind,
-                        default=inspect.Parameter.empty if default is _NO_DEFAULT else default,
+                        arg.arg,
+                        kind,
+                        default=(
+                            inspect.Parameter.empty
+                            if default is _NO_DEFAULT
+                            else default
+                        ),
                     )
                 )
             if a.vararg:
-                params.append(inspect.Parameter(a.vararg.arg, inspect.Parameter.VAR_POSITIONAL))
+                params.append(
+                    inspect.Parameter(a.vararg.arg, inspect.Parameter.VAR_POSITIONAL)
+                )
             for arg, default in zip(a.kwonlyargs, a.kw_defaults):
                 params.append(
                     inspect.Parameter(
-                        arg.arg, inspect.Parameter.KEYWORD_ONLY,
-                        default=inspect.Parameter.empty if default is None else object(),
+                        arg.arg,
+                        inspect.Parameter.KEYWORD_ONLY,
+                        default=(
+                            inspect.Parameter.empty if default is None else object()
+                        ),
                     )
                 )
             if a.kwarg:
-                params.append(inspect.Parameter(a.kwarg.arg, inspect.Parameter.VAR_KEYWORD))
+                params.append(
+                    inspect.Parameter(a.kwarg.arg, inspect.Parameter.VAR_KEYWORD)
+                )
             return inspect.Signature(params)
     raise LookupError(f"{func_name} not found in {path}")
 
@@ -99,7 +111,8 @@ def strip_max_seqlen(signature):
     """A signature as older FA4 builds had it."""
     return signature.replace(
         parameters=[
-            p for p in signature.parameters.values()
+            p
+            for p in signature.parameters.values()
             if p.name not in ("max_seqlen_q", "max_seqlen_k")
         ]
     )
@@ -171,12 +184,24 @@ class TestFA4ArgBinding(_FA4Case):
     def test_window_bounds_pass_through(self):
         self.seam.fa_forward("Q", "K", "V", window_size=(64, 0))
         _, kwargs = self.last(self.fwd)
-        self.assertEqual((kwargs["window_size_left"], kwargs["window_size_right"]), (64, 0))
+        self.assertEqual(
+            (kwargs["window_size_left"], kwargs["window_size_right"]), (64, 0)
+        )
 
     def test_dense_backward_positional_order_and_grad_buffers(self):
         self.seam.fa_backward(
-            "DO", self.q, "K", "V", "O", "LSE", self.dq, self.dk, self.dv,
-            softmax_scale=0.125, causal=True, deterministic=True,
+            "DO",
+            self.q,
+            "K",
+            "V",
+            "O",
+            "LSE",
+            self.dq,
+            self.dk,
+            self.dv,
+            softmax_scale=0.125,
+            causal=True,
+            deterministic=True,
         )
         args, kwargs = self.last(self.bwd)
         bound = self.bwd_sig.bind(*args, **kwargs)
@@ -200,8 +225,20 @@ class TestFA4ArgBinding(_FA4Case):
 
     def test_varlen_backward_binds(self):
         self.seam.fa_varlen_backward(
-            "DO", self.q, "K", "V", "O", "LSE", self.dq, self.dk, self.dv,
-            "CQ", "CK", 16, 32, causal=True,
+            "DO",
+            self.q,
+            "K",
+            "V",
+            "O",
+            "LSE",
+            self.dq,
+            self.dk,
+            self.dv,
+            "CQ",
+            "CK",
+            16,
+            32,
+            causal=True,
         )
         args, kwargs = self.last(self.bwd)
         bound = self.bwd_sig.bind(*args, **kwargs)
@@ -240,13 +277,33 @@ class TestFA4ArgBinding(_FA4Case):
             ):
                 with self.assertRaisesRegex(RuntimeError, "deterministic=False"):
                     self.seam.fa_backward(
-                        "DO", self.q, "K", "V", "O", "LSE", self.dq, self.dk, self.dv,
+                        "DO",
+                        self.q,
+                        "K",
+                        "V",
+                        "O",
+                        "LSE",
+                        self.dq,
+                        self.dk,
+                        self.dv,
                         deterministic=True,
                     )
                 with self.assertRaisesRegex(RuntimeError, "deterministic=False"):
                     self.seam.fa_varlen_backward(
-                        "DO", self.q, "K", "V", "O", "LSE", self.dq, self.dk, self.dv,
-                        "CQ", "CK", 16, 32, deterministic=True,
+                        "DO",
+                        self.q,
+                        "K",
+                        "V",
+                        "O",
+                        "LSE",
+                        self.dq,
+                        self.dk,
+                        self.dv,
+                        "CQ",
+                        "CK",
+                        16,
+                        32,
+                        deterministic=True,
                     )
                 self.assertEqual(self.bwd.calls, [])
                 # non-deterministic backward still reaches the kernel there
@@ -262,7 +319,15 @@ class TestFA4ArgBinding(_FA4Case):
                 "torch.cuda.get_device_capability", return_value=cap
             ):
                 self.seam.fa_backward(
-                    "DO", self.q, "K", "V", "O", "LSE", self.dq, self.dk, self.dv,
+                    "DO",
+                    self.q,
+                    "K",
+                    "V",
+                    "O",
+                    "LSE",
+                    self.dq,
+                    self.dk,
+                    self.dv,
                     deterministic=True,
                 )
                 _, kwargs = self.last(self.bwd)
@@ -286,8 +351,19 @@ class TestFA4OlderBuildWithoutMaxSeqlen(_FA4Case):
 
     def test_varlen_backward_drops_max_seqlen(self):
         self.seam.fa_varlen_backward(
-            "DO", self.q, "K", "V", "O", "LSE", self.dq, self.dk, self.dv,
-            "CQ", "CK", 16, 32,
+            "DO",
+            self.q,
+            "K",
+            "V",
+            "O",
+            "LSE",
+            self.dq,
+            self.dk,
+            self.dv,
+            "CQ",
+            "CK",
+            16,
+            32,
         )
         args, kwargs = self.last(self.bwd)
         self.bwd_sig.bind(*args, **kwargs)
@@ -315,13 +391,26 @@ class TestFA4OlderBuildWithoutGradBuffers(_FA4Case):
                 "DO", self.q, "K", "V", "O", "LSE", self.dq, self.dk, self.dv
             ),
             lambda: self.seam.fa_varlen_backward(
-                "DO", self.q, "K", "V", "O", "LSE", self.dq, self.dk, self.dv,
-                "CQ", "CK", 16, 32,
+                "DO",
+                self.q,
+                "K",
+                "V",
+                "O",
+                "LSE",
+                self.dq,
+                self.dk,
+                self.dv,
+                "CQ",
+                "CK",
+                16,
+                32,
             ),
         ):
             call()
             args, kwargs = self.last(self.bwd)
-            self.bwd_sig.bind(*args, **kwargs)  # would raise TypeError if passed through
+            self.bwd_sig.bind(
+                *args, **kwargs
+            )  # would raise TypeError if passed through
             for name in self.bwd_missing:
                 self.assertNotIn(name, kwargs)
             # the kernel's own gradients must land in the caller's buffers
@@ -331,7 +420,15 @@ class TestFA4OlderBuildWithoutGradBuffers(_FA4Case):
     def test_deterministic_true_is_refused_not_dropped(self):
         with self.assertRaises(NotImplementedError):
             self.seam.fa_backward(
-                "DO", self.q, "K", "V", "O", "LSE", self.dq, self.dk, self.dv,
+                "DO",
+                self.q,
+                "K",
+                "V",
+                "O",
+                "LSE",
+                self.dq,
+                self.dk,
+                self.dv,
                 deterministic=True,
             )
         self.assertEqual(self.bwd.calls, [])
@@ -342,7 +439,11 @@ class TestMaxSeqlenCheckedPerFunction(unittest.TestCase):
 
     def test_independent(self):
         sig_with = inspect.Signature(
-            [inspect.Parameter("max_seqlen_q", inspect.Parameter.KEYWORD_ONLY, default=None)]
+            [
+                inspect.Parameter(
+                    "max_seqlen_q", inspect.Parameter.KEYWORD_ONLY, default=None
+                )
+            ]
         )
         sig_without = inspect.Signature([])
         fwd = recorder(sig_with, ("O", "L"))
@@ -361,7 +462,8 @@ class TestMaxSeqlenCheckedPerFunction(unittest.TestCase):
         )
         with fake_fa4_seam() as seam:
             self.assertEqual(
-                seam._max_seqlen_kwargs(fn, 1, 2), {"max_seqlen_q": 1, "max_seqlen_k": 2}
+                seam._max_seqlen_kwargs(fn, 1, 2),
+                {"max_seqlen_q": 1, "max_seqlen_k": 2},
             )
 
 

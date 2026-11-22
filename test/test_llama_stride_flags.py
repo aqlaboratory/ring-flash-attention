@@ -4,7 +4,6 @@ import torch.distributed as dist
 from ring_flash_attn.llama_fwd_ring_bwd_flash_attn import llama_flash_attn_func
 from utils import log, seam_reference_attn, set_seed
 
-
 CONFIGS = [
     {"name": "A_none",      "fwd": None, "bwd_f": None, "bwd_l": None},
     {"name": "B_fwd",       "fwd": 1,    "bwd_f": None, "bwd_l": None},

@@ -208,7 +208,7 @@ def llama_flash_attn_forward(
             "v": v_i,
             "dropout_p": dropout_p,
             "softmax_scale": softmax_scale,
-            "causal": causal, # 'step' was not defined in this scope
+            "causal": causal,  # 'step' was not defined in this scope
             "window_size": window_size,
             "softcap": softcap,
             "alibi_slopes": alibi_slopes,

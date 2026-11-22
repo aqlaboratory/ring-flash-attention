@@ -4,7 +4,6 @@ import torch.distributed as dist
 from ring_flash_attn import ring_flash_attn_qkvpacked_func
 from utils import log, seam_reference_attn, set_seed
 
-
 def main():
     dist.init_process_group("nccl")
     rank = dist.get_rank()
