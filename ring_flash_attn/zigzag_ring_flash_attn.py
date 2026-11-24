@@ -1,7 +1,7 @@
 import torch
 import torch.distributed as dist
-from flash_attn.flash_attn_interface import _flash_attn_forward, _flash_attn_backward
-from .utils import RingComm, update_out_and_lse, get_default_args
+from .flash_attn_backend import fa_forward, fa_backward, check_variant_supported
+from .utils import RingComm, update_out_and_lse
 
 
 def zigzag_ring_flash_attn_forward(
@@ -16,6 +16,7 @@ def zigzag_ring_flash_attn_forward(
     alibi_slopes=None,
     deterministic=False,
 ):
+    check_variant_supported("zigzag_ring_flash_attn")
     assert causal == True, "zigzag ring is meaningless for causal=False"
     comm = RingComm(process_group)
 
@@ -27,35 +28,18 @@ def zigzag_ring_flash_attn_forward(
     next_k, next_v = None, None
 
     def forward(q, k, v, causal):
-        params = get_default_args(_flash_attn_forward).copy()
-        params.update(
-            {
-                "q": q,
-                "k": k,
-                "v": v,
-                "dropout_p": dropout_p,
-                "softmax_scale": softmax_scale,
-                "causal": causal,
-                "alibi_slopes": alibi_slopes,
-                "return_softmax": True and dropout_p > 0,
-            }
+        # use_custom_op=False keeps this on the plain python entry point, as before.
+        return fa_forward(
+            q,
+            k,
+            v,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            alibi_slopes=alibi_slopes,
+            use_custom_op=False,
         )
-        if "window_size" in params:
-            params.update({"window_size": window_size})
-        else:
-            params.update(
-                {
-                    "window_size_left": window_size[0],
-                    "window_size_right": window_size[1],
-                }
-            )
-        outputs = _flash_attn_forward(**params)
-        if len(outputs) == 8:
-            block_out, _, _, _, _, block_lse, _, _ = outputs
-        else:
-            assert len(outputs) == 4
-            block_out, block_lse, _, _ = outputs
-        return block_out, block_lse
 
     for step in range(comm.world_size):
         if step + 1 != comm.world_size:
@@ -103,6 +87,7 @@ def zigzag_ring_flash_attn_backward(
     alibi_slopes=None,
     deterministic=False,
 ):
+    check_variant_supported("zigzag_ring_flash_attn")
     assert causal == True, "zigzag ring is meaningless for causal=False"
     kv_comm = RingComm(process_group)
     d_kv_comm = RingComm(process_group)
@@ -125,35 +110,24 @@ def zigzag_ring_flash_attn_backward(
     def backward(dout, q, k, v, out, softmax_lse, causal):
         seqlen_q = q.shape[1]
         seqlen_kv = k.shape[1]
-        params = get_default_args(_flash_attn_backward).copy()
-        params.update(
-            {
-                "dout": dout,
-                "q": q,
-                "k": k,
-                "v": v,
-                "out": out,
-                "softmax_lse": softmax_lse,
-                "dq": dq_buffer[:, :seqlen_q],
-                "dk": dk_buffer[:, :seqlen_kv],
-                "dv": dv_buffer[:, :seqlen_kv],
-                "dropout_p": dropout_p,
-                "softmax_scale": softmax_scale,
-                "causal": causal,
-                "alibi_slopes": alibi_slopes,
-                "deterministic": deterministic,
-            }
+        fa_backward(
+            dout,
+            q,
+            k,
+            v,
+            out,
+            softmax_lse,
+            dq_buffer[:, :seqlen_q],
+            dk_buffer[:, :seqlen_kv],
+            dv_buffer[:, :seqlen_kv],
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            alibi_slopes=alibi_slopes,
+            deterministic=deterministic,
+            use_custom_op=False,
         )
-        if "window_size" in params:
-            params.update({"window_size": window_size})
-        else:
-            params.update(
-                {
-                    "window_size_left": window_size[0],
-                    "window_size_right": window_size[1],
-                }
-            )
-        _flash_attn_backward(**params)
 
     for step in range(kv_comm.world_size):
         if step + 1 != kv_comm.world_size:

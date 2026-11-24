@@ -1,13 +1,13 @@
 import torch
 import torch.distributed as dist
-from flash_attn.flash_attn_interface import (
-    _flash_attn_varlen_forward,
-    _flash_attn_varlen_backward,
+from .flash_attn_backend import (
+    fa_varlen_forward,
+    fa_varlen_backward,
+    check_variant_supported,
 )
 from .utils import (
     RingComm,
     update_out_and_lse,
-    get_default_args,
 )
 
 try:
@@ -37,6 +37,7 @@ def ring_flash_attn_varlen_forward(
     alibi_slopes=None,
     deterministic=False,
 ):
+    check_variant_supported("ring_flash_attn_varlen")
     comm = RingComm(process_group)
 
     out = None
@@ -48,40 +49,21 @@ def ring_flash_attn_varlen_forward(
         if step + 1 != comm.world_size:
             next_k, next_v = comm.send_recv_kv(k, v)
         if not causal or step <= comm.rank:
-            params = get_default_args(_flash_attn_varlen_forward).copy()
-            params.update(
-                {
-                    "q": q,
-                    "k": k,
-                    "v": v,
-                    "cu_seqlens_q": cu_seqlens,
-                    "cu_seqlens_k": cu_seqlens,
-                    "max_seqlen_q": max_seqlen,
-                    "max_seqlen_k": max_seqlen,
-                    "dropout_p": dropout_p,
-                    "softmax_scale": softmax_scale,
-                    "causal": causal and step == 0,
-                    "softcap": softcap,
-                    "alibi_slopes": alibi_slopes,
-                    "return_softmax": True and dropout_p > 0,
-                }
+            block_out, block_lse = fa_varlen_forward(
+                q,
+                k,
+                v,
+                cu_seqlens,
+                cu_seqlens,
+                max_seqlen,
+                max_seqlen,
+                dropout_p=dropout_p,
+                softmax_scale=softmax_scale,
+                causal=causal and step == 0,
+                window_size=window_size,
+                softcap=softcap,
+                alibi_slopes=alibi_slopes,
             )
-            if "window_size" in params:
-                params.update({"window_size": window_size})
-            else:
-                params.update(
-                    {
-                        "window_size_left": window_size[0],
-                        "window_size_right": window_size[1],
-                    }
-                )
-
-            outputs = _flash_attn_varlen_forward(**params)
-            if len(outputs) == 8:
-                block_out, _, _, _, _, block_lse, _, _ = outputs
-            else:
-                assert len(outputs) == 4
-                block_out, block_lse, _, _ = outputs
             if block_lse.dim() == 3:
                 old_lse = True
                 block_lse = flatten_varlen_lse(
@@ -120,6 +102,7 @@ def ring_flash_attn_varlen_backward(
     alibi_slopes=None,
     deterministic=False,
 ):
+    check_variant_supported("ring_flash_attn_varlen")
     kv_comm = RingComm(process_group)
     d_kv_comm = RingComm(process_group)
     dq, dk, dv = None, None, None
@@ -138,40 +121,28 @@ def ring_flash_attn_varlen_backward(
         if step <= kv_comm.rank or not causal:
             bwd_causal = causal and step == 0
 
-            params = get_default_args(_flash_attn_varlen_backward).copy()
-            params.update(
-                {
-                    "dout": dout,
-                    "q": q,
-                    "k": k,
-                    "v": v,
-                    "out": out,
-                    "softmax_lse": softmax_lse,
-                    "dq": block_dq_buffer,
-                    "dk": block_dk_buffer,
-                    "dv": block_dv_buffer,
-                    "cu_seqlens_q": cu_seqlens,
-                    "cu_seqlens_k": cu_seqlens,
-                    "max_seqlen_q": max_seqlen,
-                    "max_seqlen_k": max_seqlen,
-                    "dropout_p": dropout_p,
-                    "softmax_scale": softmax_scale,
-                    "causal": bwd_causal,
-                    "softcap": softcap,
-                    "alibi_slopes": alibi_slopes,
-                    "deterministic": deterministic,
-                }
+            fa_varlen_backward(
+                dout,
+                q,
+                k,
+                v,
+                out,
+                softmax_lse,
+                block_dq_buffer,
+                block_dk_buffer,
+                block_dv_buffer,
+                cu_seqlens,
+                cu_seqlens,
+                max_seqlen,
+                max_seqlen,
+                dropout_p=dropout_p,
+                softmax_scale=softmax_scale,
+                causal=bwd_causal,
+                window_size=window_size,
+                softcap=softcap,
+                alibi_slopes=alibi_slopes,
+                deterministic=deterministic,
             )
-            if "window_size" in params:
-                params.update({"window_size": window_size})
-            else:
-                params.update(
-                    {
-                        "window_size_left": window_size[0],
-                        "window_size_right": window_size[1],
-                    }
-                )
-            _flash_attn_varlen_backward(**params)
 
             if dq is None:
                 dq = block_dq_buffer.to(torch.float32)

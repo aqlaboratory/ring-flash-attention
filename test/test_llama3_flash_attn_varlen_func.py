@@ -1,12 +1,11 @@
 import sys
 import torch
 import torch.distributed as dist
-from flash_attn import flash_attn_varlen_qkvpacked_func
 from ring_flash_attn import (
     llama3_flash_attn_prepare_cu_seqlens,
     llama3_flash_attn_varlen_qkvpacked_func,
 )
-from utils import log, set_seed
+from utils import log, seam_reference_varlen_attn, set_seed
 
 def main():
     dist.init_process_group("nccl")
@@ -17,7 +16,7 @@ def main():
     device = torch.device(f"cuda:{rank}")
 
     nheads = 5
-    d = 8
+    d = 32
     dropout_p = 0
     causal = True
     deterministic = False
@@ -49,16 +48,9 @@ def main():
         print("# forward:")
         print("#" * 30)
 
-    out, lse, _ = flash_attn_varlen_qkvpacked_func(
-        qkv,
-        cu_seqlens_tensor,
-        max_seqlen,
-        dropout_p=dropout_p,
-        causal=causal,
-        window_size=(-1, -1),
-        alibi_slopes=None,
-        deterministic=deterministic,
-        return_attn_probs=True,
+    q, k, v = qkv.unbind(dim=1)
+    out, lse, dq, dk, dv = seam_reference_varlen_attn(
+        q, k, v, dout, cu_seqlens_tensor, max_seqlen, causal
     )
 
     local_out = out[rank * local_length : (rank + 1) * local_length]
@@ -99,6 +91,11 @@ def main():
     if lse.dim() == 2:
         log("lse", lse, rank0_only=True)
         log("lse diff", local_lse - llama3_lse)
+    elif rank == 0:
+        print(
+            f"lse diff: NOT CHECKED -- reference lse has shape {tuple(lse.shape)}, "
+            "expected 2-D (nheads, total_q)"
+        )
 
     dist.barrier()
     if rank == 0:
@@ -106,8 +103,7 @@ def main():
         print("# backward:")
         print("#" * 30)
 
-    out.backward(dout)
-    dqkv = qkv.grad
+    dqkv = torch.stack([dq, dk, dv], dim=1)
     local_dqkv = dqkv[rank * local_length : (rank + 1) * local_length]
 
     llama3_out.backward(local_dout)
@@ -123,7 +119,6 @@ def main():
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "compile":
         torch._dynamo.config.capture_scalar_outputs = True
-        flash_attn_varlen_qkvpacked_func = torch.compile(flash_attn_varlen_qkvpacked_func)
         llama3_flash_attn_prepare_cu_seqlens = torch.compile(llama3_flash_attn_prepare_cu_seqlens)
         llama3_flash_attn_varlen_qkvpacked_func = torch.compile(llama3_flash_attn_varlen_qkvpacked_func)
     main()

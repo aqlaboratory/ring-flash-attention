@@ -1,9 +1,8 @@
 import sys
 import torch
 import torch.distributed as dist
-from flash_attn import flash_attn_qkvpacked_func
 from ring_flash_attn.llama_fwd_ring_bwd_flash_attn import llama_fwd_ring_bwd_flash_attn_func
-from utils import log, set_seed
+from utils import log, seam_reference_attn, set_seed
 
 def main():
     dist.init_process_group("nccl")
@@ -46,22 +45,15 @@ def main():
         print("# forward:")
         print("#" * 30)
 
-    out, lse, _ = flash_attn_qkvpacked_func(
-        qkv,
-        dropout_p=dropout_p,
-        causal=causal,
-        window_size=(-1, -1),
-        alibi_slopes=None,
-        deterministic=deterministic,
-        return_attn_probs=True,
-    )
+    q, k, v = qkv.unbind(dim=2)
+    out, lse, dq, dk, dv = seam_reference_attn(q, k, v, dout, causal)
 
     local_out = out.chunk(world_size, dim=1)[rank]
     local_lse = lse.chunk(world_size, dim=-1)[rank]
 
     # --- Test Subject: Ring Attention ---
     fn = llama_fwd_ring_bwd_flash_attn_func
-    
+
     # local_qkv (B, S, H, D, qkv)
     ring_out, ring_lse, _ = fn(
         local_qkv[:,:,0], 
@@ -90,8 +82,7 @@ def main():
         print("#" * 30)
 
     # --- Backward Baseline ---
-    out.backward(dout)
-    dqkv = qkv.grad
+    dqkv = torch.stack([dq, dk, dv], dim=2)
     local_dqkv = dqkv.chunk(world_size, dim=1)[rank]
 
     # --- Backward Ring ---
@@ -99,7 +90,7 @@ def main():
     ring_dqkv = local_qkv.grad
 
     log("local_dqkv", local_dqkv)
-    
+
     # Shape is (Batch, Seq, 3, Heads, Dim). We slice dim 2.
     log("dq diff", local_dqkv[:, :, 0] - ring_dqkv[:, :, 0])
     log("dk diff", local_dqkv[:, :, 1] - ring_dqkv[:, :, 1])
